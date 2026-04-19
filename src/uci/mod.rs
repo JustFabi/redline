@@ -10,6 +10,7 @@ pub struct Uci {
     board: Board,
     searcher: Searcher,
     num_threads: usize,
+    search_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Uci {
@@ -19,6 +20,7 @@ impl Uci {
             board: Board::startpos(),
             searcher: Searcher::new(tt),
             num_threads: 1,
+            search_thread: None,
         }
     }
 
@@ -63,10 +65,19 @@ impl Uci {
             }
             "go" => self.handle_go_api(&parts[1..]),
             "stop" => {
-                self.searcher.stop.store(true, Ordering::Relaxed);
+                self.searcher.stop.store(true, Ordering::SeqCst);
+                if let Some(handle) = self.search_thread.take() {
+                    let _ = handle.join();
+                }
                 vec![]
             }
-            "quit" => vec![],
+            "quit" => {
+                self.searcher.stop.store(true, Ordering::SeqCst);
+                if let Some(handle) = self.search_thread.take() {
+                    let _ = handle.join();
+                }
+                vec![]
+            }
             _ => vec![],
         }
     }
@@ -111,6 +122,12 @@ impl Uci {
     }
 
     fn handle_go_api(&mut self, args: &[&str]) -> Vec<String> {
+        // Stop any current search
+        self.searcher.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.search_thread.take() {
+            let _ = handle.join();
+        }
+
         let mut depth = None;
         let mut wtime = None;
         let mut btime = None;
@@ -182,6 +199,8 @@ impl Uci {
 
         let time_limit = if let Some(mt) = movetime {
             Some(Duration::from_millis(mt.saturating_sub(20))) // subtract a small margin
+        } else if infinite {
+            None
         } else {
             self.allocate_time(wtime, btime, winc, binc, movestogo)
         };
@@ -190,29 +209,71 @@ impl Uci {
         let search_depth = if let Some(d) = depth {
             d
         } else if time_limit.is_some() || infinite || nodes.is_some() {
-            64
+            100 // Large depth for infinite or time control
         } else {
             6
         };
 
-        let result = self.searcher.search(&mut self.board, search_depth, time_limit, self.num_threads);
+        // Clone needed data for the search thread
+        let mut board_clone = self.board.clone();
+        let num_threads = self.num_threads;
         
-        let mut responses = Vec::new();
-        for info in result.info_lines {
-            responses.push(info);
-        }
-
-        if let Some(m) = result.best_move {
-            let mut info = format!("info depth {} score cp {} nodes {}", result.depth, result.score, result.nodes);
-            // NPS (Nodes Per Second)
-            let elapsed = self.searcher.start_time.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                info.push_str(&format!(" nps {}", (result.nodes as f64 / elapsed) as u64));
+        // Use a pointer to searcher or a way to access it? 
+        // Searcher has Arc<AtomicBool> stop and Arc<TranspositionTable> tt.
+        // We need to be able to call search on it.
+        // Actually Searcher itself might need to be clonable or we create a new one with same Arcs.
+        
+        let tt_clone = Arc::clone(&self.searcher.tt);
+        let nodes_clone = Arc::clone(&self.searcher.nodes);
+        let stop_clone = Arc::clone(&self.searcher.stop);
+        
+        let handle = std::thread::spawn(move || {
+            let mut thread_searcher = Searcher::new(tt_clone);
+            thread_searcher.nodes = nodes_clone;
+            thread_searcher.stop = stop_clone;
+            
+            let result = thread_searcher.search(&mut board_clone, search_depth, time_limit, num_threads);
+            
+            let mut best_move = result.best_move;
+            let mut score = result.score;
+            let mut depth = result.depth;
+            
+            // If best_move is None (e.g. search was stopped before any move was found at depth 1), 
+            // try to find the best move from the TT.
+            if best_move.is_none() {
+                if let Some(entry) = thread_searcher.tt.probe(board_clone.hash) {
+                    best_move = entry.best_move;
+                    score = entry.score;
+                    depth = entry.depth as u32;
+                }
             }
-            responses.push(info);
-            responses.push(format!("bestmove {}", self.move_to_uci(m)));
-        }
-        responses
+
+            if let Some(m) = best_move {
+                let elapsed = thread_searcher.start_time.elapsed().as_millis() as u64;
+                let total_nodes = thread_searcher.nodes.load(Ordering::Relaxed);
+                let nps = if elapsed > 0 { (total_nodes * 1000) / elapsed } else { 0 };
+                let hashfull = thread_searcher.tt.hashfull();
+                println!("info depth {} seldepth {} multipv 1 score cp {} nodes {} nps {} hashfull {} tbhits 0 time {}",
+                    depth, thread_searcher.seldepth, score, total_nodes, nps, hashfull, elapsed);
+                println!("bestmove {}", m);
+            } else {
+                // Fallback: pick the first legal move if nothing was found
+                let moves = crate::movegen::generate_pseudo_legal_moves(&mut board_clone);
+                for m in moves {
+                    let state = board_clone.make_move(m);
+                    if !board_clone.is_in_check(board_clone.side_to_move.opposite()) {
+                        println!("bestmove {}", m);
+                        board_clone.unmake_move(m, state);
+                        return;
+                    }
+                    board_clone.unmake_move(m, state);
+                }
+            }
+        });
+
+        self.search_thread = Some(handle);
+        
+        vec![]
     }
 
 
@@ -258,24 +319,4 @@ impl Uci {
         }
     }
 
-    fn move_to_uci(&self, m: crate::board::r#move::Move) -> String {
-        let from = m.from();
-        let to = m.to();
-        let from_file = (b'a' + (from % 8)) as char;
-        let from_rank = (b'1' + (from / 8)) as char;
-        let to_file = (b'a' + (to % 8)) as char;
-        let to_rank = (b'1' + (to / 8)) as char;
-
-        let mut s = format!("{}{}{}{}", from_file, from_rank, to_file, to_rank);
-        
-        use crate::board::r#move::flags;
-        match m.flags() {
-            flags::PROMOTE_QUEEN | flags::PROMOTE_QUEEN_CAPTURE => s.push('q'),
-            flags::PROMOTE_ROOK | flags::PROMOTE_ROOK_CAPTURE => s.push('r'),
-            flags::PROMOTE_BISHOP | flags::PROMOTE_BISHOP_CAPTURE => s.push('b'),
-            flags::PROMOTE_KNIGHT | flags::PROMOTE_KNIGHT_CAPTURE => s.push('n'),
-            _ => {}
-        }
-        s
-    }
 }

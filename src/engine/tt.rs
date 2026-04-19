@@ -84,4 +84,16 @@ impl TranspositionTable {
             best_move,
         })
     }
+
+    pub fn hashfull(&self) -> usize {
+        let mut occupied = 0;
+        let sample_size = self.size.min(1000);
+        if sample_size == 0 { return 0; }
+        for i in 0..sample_size {
+            if self.table[i * 2].load(Ordering::Relaxed) != 0 {
+                occupied += 1;
+            }
+        }
+        (occupied * 1000) / sample_size
+    }
 }

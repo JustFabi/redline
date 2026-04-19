@@ -6,7 +6,7 @@ use crate::engine::eval::evaluate;
 use crate::engine::tt::{TranspositionTable, NodeType};
 use std::time::{Instant, Duration};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const INFINITY: i32 = 1000000;
 const MATE_VALUE: i32 = 100000;
@@ -20,7 +20,8 @@ pub struct SearchResult {
 }
 
 pub struct Searcher {
-    pub nodes: u64,
+    pub nodes: Arc<AtomicU64>,
+    pub seldepth: u32,
     pub start_time: Instant,
     pub time_limit: Option<Duration>,
     pub stop: Arc<AtomicBool>,
@@ -31,7 +32,8 @@ pub struct Searcher {
 impl Searcher {
     pub fn new(tt: Arc<TranspositionTable>) -> Self {
         Self {
-            nodes: 0,
+            nodes: Arc::new(AtomicU64::new(0)),
+            seldepth: 0,
             start_time: Instant::now(),
             time_limit: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -41,55 +43,82 @@ impl Searcher {
     }
 
     pub fn search(&mut self, board: &mut Board, depth: u32, time_limit: Option<Duration>, num_threads: usize) -> SearchResult {
-            self.stop.store(false, Ordering::SeqCst);
-            self.start_time = Instant::now();
-            self.time_limit = time_limit;
-            self.nodes = 0;
+        self.stop.store(false, Ordering::SeqCst);
+        self.start_time = Instant::now();
+        self.time_limit = time_limit;
+        self.nodes.store(0, Ordering::SeqCst);
+        self.seldepth = 0;
 
-            let num_threads = num_threads.max(1);
-            
-            if num_threads == 1 {
-                return self.internal_search(board, depth);
+        let num_threads = num_threads.max(1);
+
+        if num_threads == 1 {
+            return self.internal_search(board, depth);
+        }
+
+        // Lazy SMP implementation
+        crossbeam::scope(|s| {
+            for i in 0..num_threads {
+                let mut thread_searcher = Searcher::new(Arc::clone(&self.tt));
+                thread_searcher.nodes = Arc::clone(&self.nodes);
+                thread_searcher.stop = Arc::clone(&self.stop);
+                thread_searcher.time_limit = self.time_limit;
+                thread_searcher.start_time = self.start_time;
+                let mut thread_board = board.clone();
+
+                // Asymmetric search: different threads search to slightly different depths
+                let thread_depth = depth + (i % 2) as u32;
+
+                s.spawn(move |_| {
+                    thread_searcher.internal_search(&mut thread_board, thread_depth)
+                });
             }
+        }).expect("Thread search failed");
 
-            // Lazy SMP implementation
-            crossbeam::scope(|s| {
-                for i in 0..num_threads {
-                    let mut thread_searcher = Searcher::new(Arc::clone(&self.tt));
-                    thread_searcher.stop = Arc::clone(&self.stop);
-                    thread_searcher.time_limit = self.time_limit;
-                    thread_searcher.start_time = self.start_time;
-                    let mut thread_board = board.clone();
-                    
-                    // Asymmetric search: different threads search to slightly different depths
-                    let thread_depth = depth + (i % 2) as u32;
+        // After all threads are done, the result for the requested depth should be in the TT.
+        // We do one quick probe to get the best move and score.
+        let mut best_move = None;
+        let mut best_score = -INFINITY;
+        let mut reached_depth = 0;
 
-                    s.spawn(move |_| {
-                        thread_searcher.internal_search(&mut thread_board, thread_depth)
-                    });
+        if let Some(entry) = self.tt.probe(board.hash) {
+            best_move = entry.best_move;
+            best_score = entry.score;
+            reached_depth = entry.depth as u32;
+        }
+
+        SearchResult {
+            best_move,
+            score: best_score,
+            nodes: self.nodes.load(Ordering::SeqCst), // This only counts nodes from the main thread's previous searches, but TT was shared.
+            depth: reached_depth,
+            info_lines: Vec::new(),
+        }
+    }
+
+    fn extract_pv(&self, board: &mut Board, depth: u32) -> Vec<Move> {
+        let mut pv = Vec::new();
+        let mut current_board = board.clone();
+
+        for _ in 0..depth {
+            if let Some(entry) = self.tt.probe(current_board.hash) {
+                if let Some(m) = entry.best_move {
+                    // Check move legality (optional but recommended)
+                    let state = current_board.make_move(m);
+                    if current_board.is_in_check(current_board.side_to_move.opposite()) {
+                        current_board.unmake_move(m, state);
+                        break;
+                    }
+                    pv.push(m);
+                    // No unmake needed as we cloned the board or we can just continue
+                } else {
+                    break;
                 }
-            }).expect("Thread search failed");
-
-            // After all threads are done, the result for the requested depth should be in the TT.
-            // We do one quick probe to get the best move and score.
-            let mut best_move = None;
-            let mut best_score = -INFINITY;
-            let mut reached_depth = 0;
-
-            if let Some(entry) = self.tt.probe(board.hash) {
-                best_move = entry.best_move;
-                best_score = entry.score;
-                reached_depth = entry.depth as u32;
-            }
-
-            SearchResult {
-                best_move,
-                score: best_score,
-                nodes: self.nodes, // This only counts nodes from the main thread's previous searches, but TT was shared.
-                depth: reached_depth,
-                info_lines: Vec::new(),
+            } else {
+                break;
             }
         }
+        pv
+    }
 
     fn internal_search(&mut self, board: &mut Board, depth: u32) -> SearchResult {
         let mut best_move = None;
@@ -113,10 +142,10 @@ impl Searcher {
             let mut depth_interrupted = false;
             loop {
                 let (m, score) = self.negamax(board, d, alpha, beta, 0);
-                
-                if self.stop.load(Ordering::Relaxed) { 
+
+                if self.stop.load(Ordering::Relaxed) {
                     depth_interrupted = true;
-                    break; 
+                    break;
                 }
 
                 if score <= alpha {
@@ -130,7 +159,7 @@ impl Searcher {
                     best_score = score;
                     break;
                 }
-                
+
                 if delta > 1000 { // Fallback if aspiration fails badly
                     alpha = -INFINITY;
                     beta = INFINITY;
@@ -139,10 +168,16 @@ impl Searcher {
 
             if depth_interrupted { break; }
             last_completed_depth = d;
-            
-            let info = format!("info depth {} score cp {} nodes {} time {} pv {}", 
-                d, best_score, self.nodes, self.start_time.elapsed().as_millis(),
-                best_move.map(|m| m.to_string()).unwrap_or_default());
+
+            let elapsed = self.start_time.elapsed().as_millis() as u64;
+            let total_nodes = self.nodes.load(Ordering::Relaxed);
+            let nps = if elapsed > 0 { (total_nodes * 1000) / elapsed } else { 0 };
+            let hashfull = self.tt.hashfull();
+            let pv = self.extract_pv(board, d);
+            let pv_str = pv.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" ");
+
+            let info = format!("info depth {} seldepth {} multipv 1 score cp {} nodes {} nps {} hashfull {} tbhits 0 time {} pv {}",
+                d, self.seldepth, best_score, total_nodes, nps, hashfull, elapsed, pv_str);
             println!("{}", info);
             info_lines.push(info);
         }
@@ -150,15 +185,16 @@ impl Searcher {
         SearchResult {
             best_move,
             score: best_score,
-            nodes: self.nodes,
+            nodes: self.nodes.load(Ordering::SeqCst),
             depth: last_completed_depth,
             info_lines,
         }
     }
 
     fn negamax(&mut self, board: &mut Board, depth: u32, alpha: i32, beta: i32, ply: u32) -> (Option<Move>, i32) {
-            self.nodes += 1;
-            if (self.nodes & 2047) == 0 { self.check_time(); }
+            let current_nodes = self.nodes.fetch_add(1, Ordering::Relaxed) + 1;
+            self.seldepth = self.seldepth.max(ply);
+            if (current_nodes & 2047) == 0 { self.check_time(); }
             if self.stop.load(Ordering::Relaxed) { return (None, 0); }
 
             // Mate distance pruning
@@ -182,7 +218,7 @@ impl Searcher {
             }
 
             if depth == 0 {
-                return (None, self.quiescence(board, alpha, beta));
+                return (None, self.quiescence(board, alpha, beta, ply));
             }
 
             // Null Move Pruning (NMP)
@@ -218,6 +254,13 @@ impl Searcher {
                     continue;
                 }
                 legal_moves_count += 1;
+
+                if ply == 0 {
+                    let elapsed = self.start_time.elapsed().as_millis() as u64;
+                    let total_nodes = self.nodes.load(Ordering::Relaxed);
+                    let nps = if elapsed > 0 { (total_nodes * 1000) / elapsed } else { 0 };
+                    println!("info depth {} currmove {} currmovenumber {} nodes {} nps {} time {}", depth, m, legal_moves_count, total_nodes, nps, elapsed);
+                }
 
                 let mut score;
                 // Late Move Reductions (LMR)
@@ -267,9 +310,10 @@ impl Searcher {
             (best_move, max_score)
         }
 
-    fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32) -> i32 {
-            self.nodes += 1;
-            if (self.nodes & 2047) == 0 { self.check_time(); }
+    fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u32) -> i32 {
+            let current_nodes = self.nodes.fetch_add(1, Ordering::Relaxed) + 1;
+            self.seldepth = self.seldepth.max(ply);
+            if (current_nodes & 2047) == 0 { self.check_time(); }
             if self.stop.load(Ordering::Relaxed) { return 0; }
 
             let stand_pat = evaluate(board);
@@ -288,7 +332,7 @@ impl Searcher {
                     board.unmake_move(m, state);
                     continue;
                 }
-                let score = -self.quiescence(board, -beta, -alpha);
+                let score = -self.quiescence(board, -beta, -alpha, ply + 1);
                 board.unmake_move(m, state);
 
                 if self.stop.load(Ordering::Relaxed) { return 0; }
@@ -395,7 +439,7 @@ mod tests {
 
         let tt = Arc::new(TranspositionTable::new(1));
         let mut searcher = Searcher::new(tt);
-        let mut result = searcher.search(&mut board, 3, None, 1);
+        let result = searcher.search(&mut board, 3, None, 1);
         
         assert!(result.best_move.is_some());
         assert_eq!(result.depth, 3);
