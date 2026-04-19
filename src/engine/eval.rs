@@ -1,5 +1,6 @@
 use crate::board::board::Board;
 use crate::board::piece::Color;
+use crate::board::bitboard::count_bits;
 
 /// Basic evaluation scores (in centipawns)
 pub const PAWN_VALUE: i32 = 100;
@@ -96,67 +97,62 @@ pub const KING_ENDGAME_PST: [i32; 64] = [
     -50,-30,-30,-30,-30,-30,-30,-50
 ];
 
-pub fn evaluate(board: &Board) -> i32 {
-    let mut score = 0;
+const PHASE_VALUES: [i32; 6] = [0, 1, 1, 2, 4, 0]; // Pawn, Knight, Bishop, Rook, Queen, King
 
-    score += evaluate_color(board, Color::White);
-    score -= evaluate_color(board, Color::Black);
+pub fn evaluate(board: &Board) -> i32 {
+    let mut midgame = 0;
+    let mut endgame = 0;
+    let mut phase = 0;
+
+    // Material and PST for both sides
+    for color in [Color::White, Color::Black] {
+        let side = color.idx();
+        let multiplier = if color == Color::White { 1 } else { -1 };
+
+        // Material values (using simple centipawns)
+        let w_pawns = board.pawns[side];
+        let w_knights = board.knights[side];
+        let w_bishops = board.bishops[side];
+        let w_rooks = board.rooks[side];
+        let w_queens = board.queens[side];
+        let w_kings = board.kings[side];
+
+        phase += count_bits(w_knights) as i32 * PHASE_VALUES[1];
+        phase += count_bits(w_bishops) as i32 * PHASE_VALUES[2];
+        phase += count_bits(w_rooks) as i32 * PHASE_VALUES[3];
+        phase += count_bits(w_queens) as i32 * PHASE_VALUES[4];
+
+        let mut eval_pieces = |mut bb: u64, val: i32, pst: &[i32; 64]| {
+            while bb != 0 {
+                let sq = crate::board::bitboard::pop_lsb(&mut bb);
+                let pst_sq = if color == Color::White { ((7 - (sq / 8)) * 8 + (sq % 8)) as usize } else { sq as usize };
+                midgame += multiplier * (val + pst[pst_sq]);
+                endgame += multiplier * (val + pst[pst_sq]);
+            }
+        };
+
+        eval_pieces(w_pawns, PAWN_VALUE, &PAWN_PST);
+        eval_pieces(w_knights, KNIGHT_VALUE, &KNIGHT_PST);
+        eval_pieces(w_bishops, BISHOP_VALUE, &BISHOP_PST);
+        eval_pieces(w_rooks, ROOK_VALUE, &ROOK_PST);
+        eval_pieces(w_queens, QUEEN_VALUE, &QUEEN_PST);
+
+        // King PST (Midgame/Endgame split)
+        let mut king_bb = w_kings;
+        while king_bb != 0 {
+            let sq = crate::board::bitboard::pop_lsb(&mut king_bb);
+            let pst_sq = if color == Color::White { ((7 - (sq / 8)) * 8 + (sq % 8)) as usize } else { sq as usize };
+            midgame += multiplier * (KING_VALUE + KING_MIDGAME_PST[pst_sq]);
+            endgame += multiplier * (KING_VALUE + KING_ENDGAME_PST[pst_sq]);
+        }
+    }
+
+    // Phase calculation (24 is starting material phase)
+    let phase = (phase * 256 + 12) / 24;
+    let score = ((midgame * (256 - phase)) + (endgame * phase)) / 256;
 
     // Return score from side to move's perspective
-    if board.side_to_move == Color::White {
-        score
-    } else {
-        -score
-    }
-}
-
-fn evaluate_color(board: &Board, color: Color) -> i32 {
-    let mut score = 0;
-    let side = color.idx();
-
-    // Material and PST
-    score += count_material_and_pst(board.pawns[side], PAWN_VALUE, &PAWN_PST, color);
-    score += count_material_and_pst(board.knights[side], KNIGHT_VALUE, &KNIGHT_PST, color);
-    score += count_material_and_pst(board.bishops[side], BISHOP_VALUE, &BISHOP_PST, color);
-    score += count_material_and_pst(board.rooks[side], ROOK_VALUE, &ROOK_PST, color);
-    score += count_material_and_pst(board.queens[side], QUEEN_VALUE, &QUEEN_PST, color);
-
-    // King safety (simplified: use midgame or endgame PST based on material)
-    let is_endgame = is_endgame(board);
-    let king_pst = if is_endgame { &KING_ENDGAME_PST } else { &KING_MIDGAME_PST };
-    score += count_material_and_pst(board.kings[side], KING_VALUE, king_pst, color);
-
-    score
-}
-
-fn count_material_and_pst(mut bb: u64, piece_value: i32, pst: &[i32; 64], color: Color) -> i32 {
-    let mut score = 0;
-    while bb != 0 {
-        let sq = crate::board::bitboard::pop_lsb(&mut bb);
-        score += piece_value;
-        
-        // PST square mapping
-        let pst_sq = if color == Color::White {
-            ((7 - (sq / 8)) * 8 + (sq % 8)) as usize
-        } else {
-            sq as usize
-        };
-        score += pst[pst_sq];
-    }
-    score
-}
-
-fn is_endgame(board: &Board) -> bool {
-    // Very simple endgame detection: no queens, or one queen and no other pieces
-    let w_queens = crate::board::bitboard::count_bits(board.queens[0]);
-    let b_queens = crate::board::bitboard::count_bits(board.queens[1]);
-    
-    if w_queens == 0 && b_queens == 0 {
-        return true;
-    }
-    
-    // More accurate would be counting total material
-    false
+    if board.side_to_move == Color::White { score } else { -score }
 }
 
 #[cfg(test)]

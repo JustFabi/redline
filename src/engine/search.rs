@@ -27,6 +27,7 @@ pub struct Searcher {
     pub stop: Arc<AtomicBool>,
     pub tt: Arc<TranspositionTable>,
     pub killer_moves: [[Option<Move>; 2]; 128], // Killer moves for move ordering
+    pub history: [[[i32; 64]; 64]; 2],         // History heuristic: history[color][from][to]
 }
 
 impl Searcher {
@@ -39,6 +40,7 @@ impl Searcher {
             stop: Arc::new(AtomicBool::new(false)),
             tt,
             killer_moves: [[None; 2]; 128],
+            history: [[[0; 64]; 64]; 2],
         }
     }
 
@@ -238,6 +240,15 @@ impl Searcher {
             // Use generate_pseudo_legal_moves for performance
             let mut moves = movegen::generate_pseudo_legal_moves(board);
 
+            // RFP / Static Null Move Pruning
+            if depth <= 3 && !board.is_in_check(board.side_to_move) && ply > 0 {
+                let static_eval = evaluate(board);
+                let margin = 120 * depth as i32;
+                if static_eval - margin >= beta {
+                    return (None, static_eval - margin);
+                }
+            }
+
             let mut best_move = None;
             let mut max_score = -INFINITY;
             let old_alpha = alpha;
@@ -255,6 +266,16 @@ impl Searcher {
                 }
                 legal_moves_count += 1;
 
+                // Futility Pruning
+                if depth == 1 && !board.is_in_check(board.side_to_move) && legal_moves_count > 1 
+                    && (m.flags() & flags::CAPTURE) == 0 && (m.flags() & (flags::PROMOTE_QUEEN | flags::PROMOTE_QUEEN_CAPTURE)) == 0 {
+                    let static_eval = evaluate(board);
+                    if static_eval + 150 < alpha {
+                        board.unmake_move(m, state);
+                        continue;
+                    }
+                }
+
                 if ply == 0 {
                     let elapsed = self.start_time.elapsed().as_millis() as u64;
                     let total_nodes = self.nodes.load(Ordering::Relaxed);
@@ -265,8 +286,17 @@ impl Searcher {
                 let mut score;
                 // Late Move Reductions (LMR)
                 if depth >= 3 && legal_moves_count > 4 && (m.flags() & flags::CAPTURE) == 0 && (m.flags() & (flags::PROMOTE_QUEEN | flags::PROMOTE_QUEEN_CAPTURE)) == 0 && !board.is_in_check(board.side_to_move) {
-                    let reduction = 1;
-                    let (_, s) = self.negamax(board, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1);
+                    let mut reduction: u32 = 1;
+                    if legal_moves_count > 12 { reduction += 1; }
+                    if depth > 5 { reduction += 1; }
+                    
+                    // History-based LMR
+                    let history_score = self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
+                    if history_score > 5000 {
+                        reduction = reduction.saturating_sub(1);
+                    }
+
+                    let (_, s) = self.negamax(board, depth.saturating_sub(1 + reduction), -alpha - 1, -alpha, ply + 1);
                     score = -s;
                     
                     // If the reduced search improved alpha, re-search at full depth
@@ -290,10 +320,17 @@ impl Searcher {
                 if score > alpha {
                     alpha = score;
                     if alpha >= beta { 
-                        // Store killer moves
-                        if (m.flags() & flags::CAPTURE) == 0 && ply < 128 {
-                            self.killer_moves[ply as usize][1] = self.killer_moves[ply as usize][0];
-                            self.killer_moves[ply as usize][0] = Some(m);
+                        // Update heuristics for quiet moves
+                        if (m.flags() & flags::CAPTURE) == 0 {
+                            // Store killer moves
+                            if ply < 128 {
+                                self.killer_moves[ply as usize][1] = self.killer_moves[ply as usize][0];
+                                self.killer_moves[ply as usize][0] = Some(m);
+                            }
+                            // Update history heuristic
+                            let bonus = (depth * depth) as i32;
+                            let entry = &mut self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
+                            *entry = (*entry + bonus).min(100000);
                         }
                         break; 
                     }
@@ -358,7 +395,7 @@ impl Searcher {
 
     fn score_move(&self, m: Move, board: &Board, tt_move: Option<Move>, ply: u32) -> i32 {
             if Some(m) == tt_move { return 1000000; }
-            let mut score = 0;
+            let mut score;
             if (m.flags() & flags::CAPTURE) != 0 {
                 let attacker = board.pieces[m.from() as usize].unwrap_or(PieceType::Pawn);
                 let victim = board.pieces[m.to() as usize].unwrap_or(PieceType::Pawn);
@@ -369,6 +406,8 @@ impl Searcher {
                     if Some(m) == self.killer_moves[ply as usize][0] { return 9000; }
                     if Some(m) == self.killer_moves[ply as usize][1] { return 8000; }
                 }
+                // History heuristic
+                score = self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize] / 10;
             }
             
             // Promotion

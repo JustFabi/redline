@@ -20,21 +20,21 @@ pub struct TTEntry {
 
 pub struct TranspositionTable {
     table: Vec<AtomicU64>,
-    size: usize,
+    mask: usize,
 }
 
 impl TranspositionTable {
     pub fn new(mb: usize) -> Self {
-        let size = mb * 1024 * 1024 / 16;
-        let mut table = Vec::with_capacity(size * 2);
-        for _ in 0..size * 2 {
+        let count = (mb * 1024 * 1024 / 16).next_power_of_two();
+        let mut table = Vec::with_capacity(count * 2);
+        for _ in 0..count * 2 {
             table.push(AtomicU64::new(0));
         }
-        Self { table, size }
+        Self { table, mask: count - 1 }
     }
 
     pub fn store(&self, key: u64, depth: u8, score: i32, node_type: NodeType, best_move: Option<Move>) {
-        let idx = (key as usize % self.size) * 2;
+        let idx = (key as usize & self.mask) * 2;
         
         let mut data = 0u64;
         data |= (depth as u64) & 0xFF;
@@ -55,7 +55,7 @@ impl TranspositionTable {
     }
 
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        let idx = (key as usize % self.size) * 2;
+        let idx = (key as usize & self.mask) * 2;
         
         let stored_key = self.table[idx].load(Ordering::Acquire);
         if stored_key != key {
@@ -87,7 +87,7 @@ impl TranspositionTable {
 
     pub fn hashfull(&self) -> usize {
         let mut occupied = 0;
-        let sample_size = self.size.min(1000);
+        let sample_size = (self.mask + 1).min(1000);
         if sample_size == 0 { return 0; }
         for i in 0..sample_size {
             if self.table[i * 2].load(Ordering::Relaxed) != 0 {
