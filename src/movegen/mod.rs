@@ -4,7 +4,13 @@ pub mod sliding;
 pub mod king;
 
 use crate::board::board::Board;
-use crate::board::r#move::Move;
+use crate::board::r#move::{Move, flags};
+
+pub fn init_all() {
+    knight::init_knight_attacks();
+    king::init_king_attacks();
+    crate::magic::init_magics();
+}
 
 pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
     let mut moves = Vec::with_capacity(64);
@@ -20,13 +26,37 @@ pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
 
     let mut legal_moves = Vec::with_capacity(pseudo_moves.len());
     let mut temp_board = board.clone();
+    let is_currently_in_check = is_check(board); // Cache this
+
     for m in pseudo_moves {
+        let f = m.flags();
+        
+        // --- CASTLING LEGALITY CHECK ---
+        if f == flags::KING_CASTLE || f == flags::QUEEN_CASTLE {
+            // Rule 1: Cannot castle out of check
+            if is_currently_in_check {
+                continue; 
+            }
+            
+            // Rule 2: Cannot castle through check
+            let intermediate_sq = if f == flags::KING_CASTLE {
+                m.from() + 1 // e1 -> f1 (White) or e8 -> f8 (Black)
+            } else {
+                m.from() - 1 // e1 -> d1 (White) or e8 -> d8 (Black)
+            };
+            
+            if board.is_square_attacked(intermediate_sq, board.side_to_move.opposite()) {
+                continue;
+            }
+        }
+
         let state = temp_board.make_move(m);
-        // After making the move, the side to move is the opponent.
-        // We need to check if the side that just moved (opposite of current side) is in check.
+        
+        // Rule 3: Final square (or any normal move) cannot leave King in check
         if !temp_board.is_in_check(board.side_to_move) {
             legal_moves.push(m);
         }
+        
         temp_board.unmake_move(m, state);
     }
     legal_moves
@@ -99,6 +129,7 @@ mod tests {
     fn perft(board: &Board, depth: u32) -> u64 {
         if depth == 0 { return 1; }
         let mut nodes = 0;
+
         let moves = generate_legal_moves(board);
         for m in moves {
             let mut temp = board.clone();
@@ -110,8 +141,7 @@ mod tests {
 
     #[test]
     fn test_perft_startpos() {
-        crate::movegen::knight::init_knight_attacks();
-        crate::movegen::king::init_king_attacks();
+        init_all();
         let b = Board::startpos();
         assert_eq!(perft(&b, 1), 20);
         assert_eq!(perft(&b, 2), 400);
@@ -120,8 +150,7 @@ mod tests {
 
     #[test]
     fn test_checkmate() {
-        crate::movegen::knight::init_knight_attacks();
-        crate::movegen::king::init_king_attacks();
+        init_all();
         let mut b = Board::startpos();
         // Fool's mate
         // 1. f3 e5 2. g4 Qh4#
@@ -135,8 +164,7 @@ mod tests {
 
     #[test]
     fn test_stalemate() {
-        crate::movegen::knight::init_knight_attacks();
-        crate::movegen::king::init_king_attacks();
+        init_all();
         // A known stalemate position
         let mut b = Board {
             pawns: [0; 2],

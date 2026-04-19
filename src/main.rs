@@ -1,5 +1,6 @@
 mod board;
 mod movegen;
+mod magic;
 mod engine;
 mod uci;
 mod api;
@@ -12,6 +13,7 @@ fn main() {
     // Initialize precomputed tables
     init_knight_attacks();
     init_king_attacks();
+    magic::init_magics();
 
     let args: Vec<String> = std::env::args().collect();
 

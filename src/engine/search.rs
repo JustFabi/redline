@@ -441,13 +441,11 @@ impl Searcher {
 mod tests {
     use super::*;
     use crate::board::board::Board;
-    use crate::movegen::knight::init_knight_attacks;
-    use crate::movegen::king::init_king_attacks;
+    use crate::movegen::init_all;
 
     #[test]
     fn test_mate_in_one() {
-        init_knight_attacks();
-        init_king_attacks();
+        init_all();
         // Mate in one position: White to move
         // White: Kh1, Ra7, Ra8
         // Black: Kh8
@@ -490,8 +488,7 @@ mod tests {
 
     #[test]
     fn test_search_depth_with_time_limit() {
-        init_knight_attacks();
-        init_king_attacks();
+        init_all();
         let mut board = Board::startpos();
         let tt = Arc::new(TranspositionTable::new(1));
         let mut searcher = Searcher::new(tt);
@@ -505,8 +502,7 @@ mod tests {
 
     #[test]
     fn test_search_multithreaded() {
-        init_knight_attacks();
-        init_king_attacks();
+        init_all();
         let mut board = Board::startpos();
         let tt = Arc::new(TranspositionTable::new(1));
         let mut searcher = Searcher::new(tt);

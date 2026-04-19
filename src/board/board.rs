@@ -627,16 +627,20 @@ impl Board {
     fn remove_piece_no_hash(&mut self, sq: u8, pt: PieceType, color: Color) {
         let bb = bit(sq);
         let c = color.idx();
+        let mask = !bb;
         match pt {
-            PieceType::Pawn => self.pawns[c] &= !bb,
-            PieceType::Knight => self.knights[c] &= !bb,
-            PieceType::Bishop => self.bishops[c] &= !bb,
-            PieceType::Rook => self.rooks[c] &= !bb,
-            PieceType::Queen => self.queens[c] &= !bb,
-            PieceType::King => self.kings[c] &= !bb,
+            PieceType::Pawn => self.pawns[c] &= mask,
+            PieceType::Knight => self.knights[c] &= mask,
+            PieceType::Bishop => self.bishops[c] &= mask,
+            PieceType::Rook => self.rooks[c] &= mask,
+            PieceType::Queen => self.queens[c] &= mask,
+            PieceType::King => self.kings[c] &= mask,
         }
         self.pieces[sq as usize] = None;
         self.colors[sq as usize] = None;
+
+        self.occupancy[c] &= mask;
+        self.all_occupancy &= mask;
     }
 
     fn put_piece_no_hash(&mut self, sq: u8, pt: PieceType, color: Color) {
@@ -652,6 +656,9 @@ impl Board {
         }
         self.pieces[sq as usize] = Some(pt);
         self.colors[sq as usize] = Some(color);
+
+        self.occupancy[c] |= bb;
+        self.all_occupancy |= bb;
     }
 
        // Check if the move is legal AFTER it has been made
