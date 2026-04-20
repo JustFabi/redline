@@ -118,6 +118,11 @@ impl Uci {
             if let Ok(threads) = args[3].parse::<usize>() {
                 self.num_threads = threads;
             }
+        } else if args.len() >= 4 && args[0] == "name" && args[1] == "Hash" && args[2] == "value" {
+            if let Ok(mb) = args[3].parse::<usize>() {
+                let tt = Arc::new(TranspositionTable::new(mb));
+                self.searcher.tt = tt;
+            }
         }
     }
 
@@ -253,8 +258,8 @@ impl Uci {
                 let total_nodes = thread_searcher.nodes.load(Ordering::Relaxed);
                 let nps = if elapsed > 0 { (total_nodes * 1000) / elapsed } else { 0 };
                 let hashfull = thread_searcher.tt.hashfull();
-                println!("info depth {} seldepth {} multipv 1 score cp {} nodes {} nps {} hashfull {} tbhits 0 time {}",
-                    depth, thread_searcher.seldepth, score, total_nodes, nps, hashfull, elapsed);
+                println!("info depth {} seldepth {} multipv 1 score {} nodes {} nps {} hashfull {} tbhits 0 time {}",
+                    depth, thread_searcher.seldepth, thread_searcher.format_score(score), total_nodes, nps, hashfull, elapsed);
                 println!("bestmove {}", m);
             } else {
                 // Fallback: pick the first legal move if nothing was found

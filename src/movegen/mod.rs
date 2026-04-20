@@ -2,63 +2,144 @@ pub mod pawn;
 pub mod knight;
 pub mod sliding;
 pub mod king;
+pub mod move_list;
 
 use crate::board::board::Board;
-use crate::board::r#move::{Move, flags};
+use crate::board::r#move::flags;
+use crate::movegen::move_list::MoveList;
+use crate::board::bitboard::{bit, count_bits};
 
 pub fn init_all() {
     knight::init_knight_attacks();
     king::init_king_attacks();
+    pawn::init_pawn_attacks();
     crate::magic::init_magics();
 }
 
-pub fn generate_pseudo_legal_moves(board: &Board) -> Vec<Move> {
-    let mut moves = Vec::with_capacity(64);
-    pawn::generate_pawn_moves(board, &mut moves);
-    knight::generate_knight_moves(board, &mut moves);
-    sliding::generate_sliding_moves(board, &mut moves);
-    king::generate_king_moves(board, &mut moves);
-    moves
-}
+    pub fn generate_pseudo_legal_moves(board: &Board) -> MoveList {
+        let mut moves = MoveList::new();
+        pawn::generate_pawn_moves(board, &mut moves, false);
+        knight::generate_knight_moves(board, &mut moves, false);
+        sliding::generate_sliding_moves(board, &mut moves, false);
+        king::generate_king_moves(board, &mut moves, false);
+        moves
+    }
 
-pub fn generate_legal_moves(board: &Board) -> Vec<Move> {
-    let pseudo_moves = generate_pseudo_legal_moves(board);
+    pub fn generate_captures(board: &Board) -> MoveList {
+        let mut moves = MoveList::new();
+        pawn::generate_pawn_moves(board, &mut moves, true);
+        knight::generate_knight_moves(board, &mut moves, true);
+        sliding::generate_sliding_moves(board, &mut moves, true);
+        king::generate_king_moves(board, &mut moves, true);
+        moves
+    }
 
-    let mut legal_moves = Vec::with_capacity(pseudo_moves.len());
-    let mut temp_board = board.clone();
-    let is_currently_in_check = is_check(board); // Cache this
+    pub fn generate_evasions(board: &Board) -> MoveList {
+        let mut moves = MoveList::new();
+        let side = board.side_to_move;
+        let king_sq = board.kings[side.idx()].trailing_zeros() as u8;
+        let (_, checkers) = board.pins_and_checkers(side);
+        let num_checkers = count_bits(checkers);
 
-    for m in pseudo_moves {
-        let f = m.flags();
-        
-        // --- CASTLING LEGALITY CHECK ---
-        if f == flags::KING_CASTLE || f == flags::QUEEN_CASTLE {
-            // Rule 1: Cannot castle out of check
-            if is_currently_in_check {
-                continue; 
+        // 1. King moves
+        king::generate_king_moves(board, &mut moves, false);
+
+        // 2. If single check, we can block or capture
+        if num_checkers == 1 {
+            let checker_sq = checkers.trailing_zeros() as u8;
+            let target_mask = bit(checker_sq) | board.between(king_sq, checker_sq);
+            
+            let mut all_pseudo = MoveList::new();
+            pawn::generate_pawn_moves(board, &mut all_pseudo, false);
+            knight::generate_knight_moves(board, &mut all_pseudo, false);
+            sliding::generate_sliding_moves(board, &mut all_pseudo, false);
+
+            for i in 0..all_pseudo.len() {
+                let m = all_pseudo.get(i);
+                if (bit(m.to()) & target_mask) != 0 || m.flags() == flags::EN_PASSANT {
+                    moves.push(m);
+                }
             }
-            
-            // Rule 2: Cannot castle through check
-            let intermediate_sq = if f == flags::KING_CASTLE {
-                m.from() + 1 // e1 -> f1 (White) or e8 -> f8 (Black)
-            } else {
-                m.from() - 1 // e1 -> d1 (White) or e8 -> d8 (Black)
-            };
-            
-            if board.is_square_attacked(intermediate_sq, board.side_to_move.opposite()) {
+        }
+        // If double check, only king moves (already added)
+
+        moves
+    }
+
+pub fn generate_legal_moves(board: &Board) -> MoveList {
+    let side = board.side_to_move;
+    let king_sq = board.kings[side.idx()].trailing_zeros() as u8;
+    let (pinned, checkers) = board.pins_and_checkers(side);
+    let num_checkers = count_bits(checkers);
+
+    let mut legal_moves = MoveList::new();
+    let pseudo_moves = generate_pseudo_legal_moves(board);
+    let mut temp_board = board.clone();
+
+    // If in double check, only king moves can be legal
+    if num_checkers > 1 {
+        for i in 0..pseudo_moves.len() {
+            let m = pseudo_moves.get(i);
+            if m.from() == king_sq {
+                let state = temp_board.make_move(m);
+                if !temp_board.is_in_check(side) {
+                    legal_moves.push(m);
+                }
+                temp_board.unmake_move(m, state);
+            }
+        }
+        return legal_moves;
+    }
+
+    // Single check or no check
+    for i in 0..pseudo_moves.len() {
+        let m = pseudo_moves.get(i);
+        let from = m.from();
+        let f = m.flags();
+
+        // 1. King moves: always need to check if destination is attacked
+        if from == king_sq {
+            let state = temp_board.make_move(m);
+            if !temp_board.is_in_check(side) {
+                legal_moves.push(m);
+            }
+            temp_board.unmake_move(m, state);
+            continue;
+        }
+
+        // 2. If in single check, non-king move must block or capture the checker
+        if num_checkers == 1 {
+            let checker_sq = checkers.trailing_zeros() as u8;
+            let target_mask = bit(checker_sq) | board.between(king_sq, checker_sq);
+            if (bit(m.to()) & target_mask) == 0 && f != flags::EN_PASSANT {
                 continue;
             }
         }
 
-        let state = temp_board.make_move(m);
-        
-        // Rule 3: Final square (or any normal move) cannot leave King in check
-        if !temp_board.is_in_check(board.side_to_move) {
-            legal_moves.push(m);
+        // 3. Pinned pieces can only move along the pin ray
+        if (bit(from) & pinned) != 0 {
+            let state = temp_board.make_move(m);
+            if !temp_board.is_in_check(side) {
+                legal_moves.push(m);
+            }
+            temp_board.unmake_move(m, state);
+            continue;
         }
-        
-        temp_board.unmake_move(m, state);
+
+        // 4. En passant is special because it removes TWO pieces from the rank
+        if f == flags::EN_PASSANT {
+            let state = temp_board.make_move(m);
+            if !temp_board.is_in_check(side) {
+                legal_moves.push(m);
+            }
+            temp_board.unmake_move(m, state);
+            continue;
+        }
+
+        // 5. All other moves are legal!
+        legal_moves.push(m);
     }
+
     legal_moves
 }
 
@@ -180,6 +261,8 @@ mod tests {
             en_passant_square: None,
             halfmove_clock: 0,
             fullmove_number: 1,
+            last_move: None,
+            history: Vec::new(),
             pieces: [None; 64],
             colors: [None; 64],
             hash: 0,

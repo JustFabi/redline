@@ -53,7 +53,7 @@ impl Move {
     }
 
     #[inline(always)]
-    pub fn from_raw(raw: u16) -> Self {
+    pub const fn from_raw(raw: u16) -> Self {
         Self(raw)
     }
 }

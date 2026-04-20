@@ -16,6 +16,7 @@ pub struct TTEntry {
     pub score: i32,
     pub node_type: NodeType,
     pub best_move: Option<Move>,
+    pub age: u8,
 }
 
 pub struct TranspositionTable {
@@ -33,9 +34,22 @@ impl TranspositionTable {
         Self { table, mask: count - 1 }
     }
 
-    pub fn store(&self, key: u64, depth: u8, score: i32, node_type: NodeType, best_move: Option<Move>) {
+    pub fn store(&self, key: u64, depth: u8, score: i32, node_type: NodeType, best_move: Option<Move>, age: u8) {
         let idx = (key as usize & self.mask) * 2;
         
+        let existing_data = self.table[idx + 1].load(Ordering::Relaxed);
+        let existing_depth = (existing_data & 0xFF) as u8;
+        let existing_age = ((existing_data >> 42) & 0x3F) as u8;
+        
+        // Age-preferred replacement: if age is different, we definitely want to replace if depth is reasonable.
+        // Usually: (new_age != existing_age) OR (new_depth >= existing_depth)
+        if age == existing_age && depth < existing_depth {
+            let stored_key = self.table[idx].load(Ordering::Relaxed);
+            if stored_key == key {
+                return;
+            }
+        }
+
         let mut data = 0u64;
         data |= (depth as u64) & 0xFF;
         data |= ((score as u64) & 0xFFFFFFFF) << 8;
@@ -44,12 +58,12 @@ impl TranspositionTable {
             NodeType::Alpha => 1,
             NodeType::Beta => 2,
         };
-        data |= (type_val << 40) & 0xFF0000000000;
+        data |= (type_val << 40) & 0x30000000000;
+        data |= ((age as u64) & 0x3F) << 42;
         if let Some(m) = best_move {
             data |= (m.raw() as u64) << 48;
         }
 
-        // Write key second to ensure we don't read partial data for a different key
         self.table[idx + 1].store(data, Ordering::Relaxed);
         self.table[idx].store(key, Ordering::Release);
     }
@@ -67,6 +81,7 @@ impl TranspositionTable {
         let depth = (data & 0xFF) as u8;
         let score = (data >> 8) as i32;
         let type_val = (data >> 40) & 0x3;
+        let age = ((data >> 42) & 0x3F) as u8;
         let node_type = match type_val {
             0 => NodeType::Exact,
             1 => NodeType::Alpha,
@@ -82,6 +97,7 @@ impl TranspositionTable {
             score,
             node_type,
             best_move,
+            age,
         })
     }
 

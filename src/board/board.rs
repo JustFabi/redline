@@ -38,6 +38,12 @@ pub struct Board {
     // Fullmove number
     pub fullmove_number: u16,
 
+    // Last move made on board
+    pub last_move: Option<Move>,
+
+    // History of hashes for repetition detection
+    pub history: Vec<u64>,
+
     // Piece at square (optional optimization)
     pub pieces: [Option<PieceType>; 64],
     pub colors: [Option<Color>; 64],
@@ -59,6 +65,7 @@ pub struct UndoState {
     pub en_passant_square: Option<u8>,
     pub halfmove_clock: u16,
     pub captured_piece: Option<PieceType>,
+    pub last_move: Option<Move>,
     pub hash: u64,
 }
 
@@ -79,6 +86,8 @@ impl Board {
             en_passant_square: None,
             halfmove_clock: 0,
             fullmove_number: 1,
+            last_move: None,
+            history: Vec::with_capacity(128),
             pieces: [None; 64],
             colors: [None; 64],
             hash: 0,
@@ -149,6 +158,8 @@ impl Board {
             en_passant_square: None,
             halfmove_clock: 0,
             fullmove_number: 1,
+            last_move: None,
+            history: Vec::with_capacity(128),
             pieces: [None; 64],
             colors: [None; 64],
             hash: 0,
@@ -230,6 +241,206 @@ impl Board {
 
         board.update_occupancy();
         Some(board)
+    }
+/// Returns whether a move is **pseudo-legal** and does **not** leave the king in check.
+    /// This is the standard "legal move" check in chess engines.
+    ///
+    /// Highly optimized:
+    /// - Early exit for most common cases
+    /// - Reuses `is_in_check` and `pins_and_checkers`
+    /// - Special fast paths for castling, en passant, and pinned pieces
+    #[inline(always)]
+    pub fn is_legal(&self, m: Move) -> bool {
+        let from = m.from();
+        let to = m.to();
+        let flags = m.flags();
+
+        // 1. Basic sanity: from square must have our piece
+        let moving_color = self.side_to_move;
+        if self.colors[from as usize] != Some(moving_color) {
+            return false;
+        }
+
+        // 2. Cannot capture own piece
+        if let Some(color) = self.colors[to as usize] {
+            if color == moving_color {
+                return false;
+            }
+        }
+
+        let pt = self.pieces[from as usize].unwrap();
+
+        // 3. Special move handling (castling, en passant, promotion)
+        match flags {
+            // ====================== CASTLING ======================
+            flags::KING_CASTLE | flags::QUEEN_CASTLE => {
+                return self.is_legal_castling(m);
+            }
+
+            // ====================== EN PASSANT ======================
+            flags::EN_PASSANT => {
+                return self.is_legal_en_passant(m);
+            }
+
+            _ => {}
+        }
+
+        // 4. Normal moves (including promotions and captures)
+
+        // Fast path: if not in check and piece is not pinned → almost always legal
+        if !self.is_in_check(moving_color) {
+            let (pinned, _) = self.pins_and_checkers(moving_color);
+
+            // If the piece is not pinned, the move is legal (we already checked basic validity)
+            if (pinned & bit(from)) == 0 {
+                return true;
+            }
+
+            // Piece is pinned → must stay on the pin line
+            return self.is_pinned_move_legal(from, to, pinned);
+        }
+
+        // 5. We are in check → more expensive validation
+        self.is_legal_when_in_check(m)
+    }
+
+    // ===================================================================
+    // Helper: Castling legality
+    // ===================================================================
+    #[inline(never)]
+    fn is_legal_castling(&self, m: Move) -> bool {
+        let side = self.side_to_move;
+        let king_from = if side == Color::White { 4 } else { 60 };
+        let flags = m.flags();
+
+        // King must be on starting square and not in check
+        if self.kings[side.idx()] != bit(king_from) || self.is_in_check(side) {
+            return false;
+        }
+
+        let (king_to, rook_from, rook_to) = if flags == flags::KING_CASTLE {
+            if side == Color::White { (6, 7, 5) } else { (62, 63, 61) }
+        } else {
+            if side == Color::White { (2, 0, 3) } else { (58, 56, 59) }
+        };
+
+        // Check castling rights
+        let required_right = if flags == flags::KING_CASTLE {
+            if side == Color::White { castling::WHITE_KING } else { castling::BLACK_KING }
+        } else {
+            if side == Color::White { castling::WHITE_QUEEN } else { castling::BLACK_QUEEN }
+        };
+        if (self.castling_rights & required_right) == 0 {
+            return false;
+        }
+
+        // Squares between king and rook must be empty
+        let between_mask = if flags == flags::KING_CASTLE {
+            if side == Color::White { bit(5) | bit(6) } else { bit(61) | bit(62) }
+        } else {
+            if side == Color::White { bit(1) | bit(2) | bit(3) } else { bit(57) | bit(58) | bit(59) }
+        };
+        if (self.all_occupancy & between_mask) != 0 {
+            return false;
+        }
+
+        // King cannot pass through or land on attacked squares
+        let passing_sq = if flags == flags::KING_CASTLE {
+            if side == Color::White { 5 } else { 61 }
+        } else {
+            if side == Color::White { 3 } else { 59 }
+        };
+
+        !self.is_square_attacked(king_from, side.opposite()) && // redundant but cheap
+        !self.is_square_attacked(passing_sq, side.opposite()) &&
+        !self.is_square_attacked(king_to, side.opposite())
+    }
+
+    // ===================================================================
+    // Helper: En passant legality
+    // ===================================================================
+    #[inline(never)]
+    fn is_legal_en_passant(&self, m: Move) -> bool {
+        let side = self.side_to_move;
+        let to = m.to();
+        let from = m.from();
+
+        // Must have en passant target
+        if self.en_passant_square != Some(to) {
+            return false;
+        }
+
+        let cap_sq = if side == Color::White { to - 8 } else { to + 8 };
+        if self.pieces[cap_sq as usize] != Some(PieceType::Pawn) {
+            return false;
+        }
+
+        // Simulate the capture and check if king is safe
+        let mut board = self.clone(); // rare path → acceptable cost
+        let _ = board.make_move(m);
+        !board.is_in_check(side)
+    }
+
+    // ===================================================================
+    // Helper: Pinned piece move validation
+    // ===================================================================
+    #[inline(always)]
+    fn is_pinned_move_legal(&self, from: u8, to: u8, pinned: u64) -> bool {
+        if (pinned & bit(from)) == 0 {
+            return true;
+        }
+
+        let king_sq = self.kings[self.side_to_move.idx()].trailing_zeros() as u8;
+        let pin_line = self.between(king_sq, from) | bit(king_sq) | bit(from);
+
+        (pin_line & bit(to)) != 0
+    }
+
+    // ===================================================================
+    // Helper: Legal when in check (single or double check)
+    // ===================================================================
+    #[inline(never)]
+    fn is_legal_when_in_check(&self, m: Move) -> bool {
+        let side = self.side_to_move;
+        let (_, checkers) = self.pins_and_checkers(side);
+
+        let num_checkers = count_bits(checkers);
+
+        if num_checkers == 0 {
+            return true; // should not happen
+        }
+
+        let from = m.from();
+        let to = m.to();
+        let pt = self.pieces[from as usize].unwrap();
+
+        // King moves are always legal if target is not attacked (already checked in basic move gen usually)
+        if pt == PieceType::King {
+            return !self.is_square_attacked(to, side.opposite());
+        }
+
+        // Double check → only king moves are possible
+        if num_checkers > 1 {
+            return false;
+        }
+
+        // Single check → can capture the checker or block it
+        let checker_sq = checkers.trailing_zeros() as u8;
+        let checker_pt = self.pieces[checker_sq as usize].unwrap();
+
+        // Capture the checking piece?
+        if to == checker_sq {
+            return true; // pinned pieces already handled earlier
+        }
+
+        // Blocking (only possible against sliding pieces)
+        if checker_pt == PieceType::Knight || checker_pt == PieceType::Pawn {
+            return false; // cannot block
+        }
+
+        // Can we block?
+        let block_mask = self.between(checker_sq, self.kings[side.idx()].trailing_zeros() as u8);
+        (block_mask & bit(to)) != 0
     }
 
     /// Recomputes occupancy bitboards
@@ -460,8 +671,11 @@ impl Board {
                en_passant_square: self.en_passant_square,
                halfmove_clock: self.halfmove_clock,
                captured_piece: self.pieces[to as usize],
+               last_move: self.last_move,
                hash: self.hash,
            };
+
+           self.last_move = Some(m);
 
            // 1. Identify moving piece
            let pt = self.pieces[from as usize].expect("Move from empty square");
@@ -534,7 +748,22 @@ impl Board {
            self.side_to_move = enemy;
            self.hash ^= ZOBRIST.hash_side();
 
+           self.history.push(state.hash);
+
            state
+       }
+
+       pub fn is_repetition(&self) -> bool {
+           if self.history.is_empty() { return false; }
+           // Check if current hash has appeared before in history
+           // Only need to check moves within the current halfmove clock range
+           let start = self.history.len().saturating_sub(self.halfmove_clock as usize);
+           for i in (start..self.history.len()).rev() {
+               if self.history[i] == self.hash {
+                   return true;
+               }
+           }
+           false
        }
 
     pub fn unmake_move(&mut self, m: Move, state: UndoState) {
@@ -546,6 +775,8 @@ impl Board {
             self.fullmove_number -= 1;
         }
         self.side_to_move = self.side_to_move.opposite();
+        self.last_move = state.last_move;
+        self.history.pop();
 
         let side = self.side_to_move;
         let enemy = side.opposite();
@@ -589,8 +820,6 @@ impl Board {
                 self.put_piece_no_hash(56, PieceType::Rook, Color::Black);
             }
         }
-        
-        self.update_occupancy();
     }
 
     pub fn make_null_move(&mut self) -> UndoState {
@@ -599,8 +828,12 @@ impl Board {
             en_passant_square: self.en_passant_square,
             halfmove_clock: self.halfmove_clock,
             captured_piece: None,
+            last_move: self.last_move,
             hash: self.hash,
         };
+
+        self.last_move = None;
+        self.history.push(self.hash);
 
         self.hash ^= ZOBRIST.hash_en_passant(self.en_passant_square);
         self.en_passant_square = None;
@@ -622,6 +855,8 @@ impl Board {
             self.fullmove_number -= 1;
         }
         self.side_to_move = self.side_to_move.opposite();
+        self.last_move = state.last_move;
+        self.history.pop();
     }
 
     fn remove_piece_no_hash(&mut self, sq: u8, pt: PieceType, color: Color) {
@@ -696,18 +931,18 @@ impl Board {
         count_bits(self.all_occupancy)
     }
 
+    pub fn has_non_pawn_material(&self, color: Color) -> bool {
+        let c = color.idx();
+        self.knights[c] != 0 || self.bishops[c] != 0 || self.rooks[c] != 0 || self.queens[c] != 0
+    }
+
     pub fn is_square_attacked(&self, sq: u8, attacker_color: Color) -> bool {
-        let bit = bit(sq);
         let occ = self.all_occupancy;
         let c = attacker_color.idx();
 
         // Pawns
-        if attacker_color == Color::White {
-            let attacks = ((bit & !0x0101010101010101) >> 9) | ((bit & !0x8080808080808080) >> 7);
-            if (attacks & self.pawns[c]) != 0 { return true; }
-        } else {
-            let attacks = ((bit & !0x0101010101010101) << 7) | ((bit & !0x8080808080808080) << 9);
-            if (attacks & self.pawns[c]) != 0 { return true; }
+        if (crate::movegen::pawn::get_pawn_attacks(sq, attacker_color.opposite()) & self.pawns[c]) != 0 {
+            return true;
         }
 
         // Knights
@@ -721,6 +956,182 @@ impl Board {
         if (get_rook_attacks(sq, occ) & (self.rooks[c] | self.queens[c])) != 0 { return true; }
 
         false
+    }
+
+    pub fn see(&self, m: Move) -> i32 {
+        let to = m.to();
+        let from = m.from();
+        
+        let mut gain = [0i32; 32];
+        let mut d = 0;
+        
+        let mut attacker_pt = self.pieces[from as usize].unwrap_or(PieceType::Pawn);
+        gain[d] = self.see_value(self.pieces[to as usize].unwrap_or(PieceType::Pawn));
+        
+        let mut occ = self.all_occupancy;
+        let mut attackers = self.all_attackers_to(to, occ);
+        
+        let mut side = self.side_to_move;
+        
+        // Remove the first attacker
+        occ &= !bit(from);
+        attackers &= !bit(from);
+        
+        // Update attackers that might be revealed (sliding pieces)
+        if attacker_pt == PieceType::Pawn || attacker_pt == PieceType::Bishop || attacker_pt == PieceType::Queen {
+            attackers |= self.get_revealed_attackers(to, from, occ) & (self.bishops[0] | self.bishops[1] | self.queens[0] | self.queens[1]);
+        }
+        if attacker_pt == PieceType::Rook || attacker_pt == PieceType::Queen {
+            attackers |= self.get_revealed_attackers(to, from, occ) & (self.rooks[0] | self.rooks[1] | self.queens[0] | self.queens[1]);
+        }
+
+        while attackers != 0 {
+            d += 1;
+            side = side.opposite();
+            
+            let attacker_sq = self.least_valuable_attacker(attackers, side);
+            if attacker_sq == 64 { break; }
+            
+            attacker_pt = self.pieces[attacker_sq as usize].unwrap();
+            gain[d] = self.see_value(attacker_pt) - gain[d - 1];
+            
+            if gain[d].max(gain[d-1]) < 0 { break; } // Optimization
+            
+            occ &= !bit(attacker_sq);
+            attackers &= !bit(attacker_sq);
+            
+            // Reveal sliding attackers
+            if attacker_pt == PieceType::Pawn || attacker_pt == PieceType::Bishop || attacker_pt == PieceType::Queen {
+                attackers |= self.get_revealed_attackers(to, attacker_sq, occ) & (self.bishops[0] | self.bishops[1] | self.queens[0] | self.queens[1]);
+            }
+            if attacker_pt == PieceType::Rook || attacker_pt == PieceType::Queen {
+                attackers |= self.get_revealed_attackers(to, attacker_sq, occ) & (self.rooks[0] | self.rooks[1] | self.queens[0] | self.queens[1]);
+            }
+            
+            // Re-filter attackers by current occupancy (it might have changed by revealed pieces)
+            attackers &= occ;
+        }
+        
+        while d > 0 {
+            gain[d - 1] = -( (-gain[d - 1]).max(gain[d]) );
+            d -= 1;
+        }
+        
+        gain[0]
+    }
+
+    fn see_value(&self, pt: PieceType) -> i32 {
+        match pt {
+            PieceType::Pawn => 100,
+            PieceType::Knight => 320,
+            PieceType::Bishop => 330,
+            PieceType::Rook => 500,
+            PieceType::Queen => 900,
+            PieceType::King => 20000,
+        }
+    }
+
+    fn all_attackers_to(&self, sq: u8, occ: u64) -> u64 {
+        let mut attackers = 0u64;
+        
+        // Pawns
+        attackers |= crate::movegen::pawn::get_pawn_attacks(sq, Color::Black) & self.pawns[0];
+        attackers |= crate::movegen::pawn::get_pawn_attacks(sq, Color::White) & self.pawns[1];
+        
+        attackers |= get_knight_attacks(sq) & (self.knights[0] | self.knights[1]);
+        attackers |= get_king_attacks(sq) & (self.kings[0] | self.kings[1]);
+        attackers |= get_bishop_attacks(sq, occ) & (self.bishops[0] | self.bishops[1] | self.queens[0] | self.queens[1]);
+        attackers |= get_rook_attacks(sq, occ) & (self.rooks[0] | self.rooks[1] | self.queens[0] | self.queens[1]);
+        
+        attackers
+    }
+
+    fn least_valuable_attacker(&self, attackers: u64, side: Color) -> u8 {
+        let c = side.idx();
+        let my_attackers = attackers & self.occupancy[c];
+        if my_attackers == 0 { return 64; }
+        
+        if (my_attackers & self.pawns[c]) != 0 { return (my_attackers & self.pawns[c]).trailing_zeros() as u8; }
+        if (my_attackers & self.knights[c]) != 0 { return (my_attackers & self.knights[c]).trailing_zeros() as u8; }
+        if (my_attackers & self.bishops[c]) != 0 { return (my_attackers & self.bishops[c]).trailing_zeros() as u8; }
+        if (my_attackers & self.rooks[c]) != 0 { return (my_attackers & self.rooks[c]).trailing_zeros() as u8; }
+        if (my_attackers & self.queens[c]) != 0 { return (my_attackers & self.queens[c]).trailing_zeros() as u8; }
+        if (my_attackers & self.kings[c]) != 0 { return (my_attackers & self.kings[c]).trailing_zeros() as u8; }
+        
+        64
+    }
+
+    fn get_revealed_attackers(&self, target_sq: u8, _from_sq: u8, occ: u64) -> u64 {
+        // Simple way: check if target_sq and from_sq are on the same line/diagonal
+        // and then return attackers on that line.
+        
+        // This is a bit complex to do perfectly without precomputed directions.
+        // For SEE, we can just re-check Bishop/Rook/Queen attacks from target_sq.
+        (get_bishop_attacks(target_sq, occ) & (self.bishops[0] | self.bishops[1] | self.queens[0] | self.queens[1])) |
+        (get_rook_attacks(target_sq, occ) & (self.rooks[0] | self.rooks[1] | self.queens[0] | self.queens[1]))
+    }
+
+    pub fn pins_and_checkers(&self, color: Color) -> (u64, u64) {
+        let mut pinned = 0u64;
+        let mut checkers = 0u64;
+        let side = color.idx();
+        let enemy = color.opposite().idx();
+        let king_sq = self.kings[side].trailing_zeros() as u8;
+        if king_sq >= 64 { return (0, 0); }
+
+        let occ = self.all_occupancy;
+
+        // Checkers
+        // Knights
+        checkers |= get_knight_attacks(king_sq) & self.knights[enemy];
+        // Pawns
+        checkers |= crate::movegen::pawn::get_pawn_attacks(king_sq, color) & self.pawns[enemy];
+
+        // Sliding checkers and pins
+        let rook_attacks = get_rook_attacks(king_sq, occ);
+        let bishop_attacks = get_bishop_attacks(king_sq, occ);
+
+        checkers |= rook_attacks & (self.rooks[enemy] | self.queens[enemy]);
+        checkers |= bishop_attacks & (self.bishops[enemy] | self.queens[enemy]);
+
+        // Potential pinners (sliding pieces even if blocked)
+        let p_rook = get_rook_attacks(king_sq, 0) & (self.rooks[enemy] | self.queens[enemy]);
+        let p_bishop = get_bishop_attacks(king_sq, 0) & (self.bishops[enemy] | self.queens[enemy]);
+
+        let mut pin_candidates = p_rook | p_bishop;
+        while pin_candidates != 0 {
+            let p_sq = pop_lsb(&mut pin_candidates);
+            let between = self.between(king_sq, p_sq) & occ;
+            if count_bits(between) == 1 {
+                pinned |= between & self.occupancy[side];
+            }
+        }
+
+        (pinned, checkers)
+    }
+
+    pub fn between(&self, s1: u8, s2: u8) -> u64 {
+        // Simple implementation of squares between two squares on a line/diagonal
+        // In a real engine, this would be a precomputed table.
+        let mut b = 0u64;
+        let r1 = (s1 / 8) as i8;
+        let c1 = (s1 % 8) as i8;
+        let r2 = (s2 / 8) as i8;
+        let c2 = (s2 % 8) as i8;
+
+        let dr = (r2 - r1).signum();
+        let dc = (c2 - c1).signum();
+
+        if dr == 0 || dc == 0 || (r1 - r2).abs() == (c1 - c2).abs() {
+            let mut r = r1 + dr;
+            let mut c = c1 + dc;
+            while r != r2 || c != c2 {
+                b |= bit((r * 8 + c) as u8);
+                r += dr;
+                c += dc;
+            }
+        }
+        b
     }
 
     pub fn compute_hash(&self) -> u64 {
