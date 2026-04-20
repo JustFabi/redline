@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const INFINITY: i32 = 1000000;
 const MATE_VALUE: i32 = 100000;
 const MAX_PLY: usize = 256;
+const DELTA_MARGIN: i32 = 200; // Safety margin for delta pruning
+const SEE_PIECE_VALUES: [i32; 7] = [100, 325, 335, 500, 975, 0, 0]; // P, N, B, R, Q, K, Empty
 
 // Precomputed LMR table to avoid per-node floating-point ln() calls.
 // Indexed as LMR_TABLE[depth][move_index], capped at 64 each.
@@ -155,9 +157,29 @@ impl Searcher {
                 }
 
                 if score <= alpha {
+                    // Fail low — widen alpha, report lowerbound
+                    if self.is_main_thread {
+                        let elapsed = self.start_time.elapsed().as_millis() as u64;
+                        let total_nodes = self.nodes.load(Ordering::Relaxed);
+                        let nps = if elapsed > 0 { (total_nodes * 1000) / elapsed } else { 0 };
+                        println!(
+                            "info depth {} seldepth {} multipv 1 score {} upperbound nodes {} nps {} hashfull {} tbhits 0 time {}",
+                            d, self.seldepth, self.format_score(score), total_nodes, nps, self.tt.hashfull(), elapsed
+                        );
+                    }
                     alpha = (alpha - delta).max(-INFINITY);
                     delta = (delta * 2).min(10_000);
                 } else if score >= beta {
+                    // Fail high — widen beta, report upperbound
+                    if self.is_main_thread {
+                        let elapsed = self.start_time.elapsed().as_millis() as u64;
+                        let total_nodes = self.nodes.load(Ordering::Relaxed);
+                        let nps = if elapsed > 0 { (total_nodes * 1000) / elapsed } else { 0 };
+                        println!(
+                            "info depth {} seldepth {} multipv 1 score {} lowerbound nodes {} nps {} hashfull {} tbhits 0 time {}",
+                            d, self.seldepth, self.format_score(score), total_nodes, nps, self.tt.hashfull(), elapsed
+                        );
+                    }
                     beta = (beta + delta).min(INFINITY);
                     delta = (delta * 2).min(10_000);
                 } else {
@@ -180,6 +202,10 @@ impl Searcher {
             }
 
             last_completed_depth = d;
+
+            if self.is_main_thread {
+                self.pv = self.extract_pv(board);
+            }
 
             let elapsed = self.start_time.elapsed().as_millis() as u64;
             let total_nodes = self.nodes.load(Ordering::Relaxed);
@@ -334,27 +360,25 @@ impl Searcher {
             }
         }
 
-        let mut moves = movegen::generate_pseudo_legal_moves(board);
-        let mut scores = self.score_moves(moves.as_slice(), board, tt_move, ply, false);
-
+        use crate::engine::movepicker::MovePicker;
+        
         let mut legal_moves = 0;
         let mut best_m = None;
         let mut max_score = -INFINITY;
         let old_alpha = alpha;
 
         let mut is_first_move = true;
+        let killers = if ply < MAX_PLY as u32 { self.killer_moves[ply as usize] } else { [None, None] };
+        let mut picker = MovePicker::new(tt_move, killers, false);
 
-        for i in 0..moves.len() {
-            self.pick_move(moves.as_mut_slice(), &mut scores, i);
-            let m = moves.get(i);
-
+        while let Some(m) = picker.next(self, board, ply) {
             if !board.is_legal(m) {
                 continue;
             }
 
             if ply == 0 && self.is_main_thread {
                 let elapsed = self.start_time.elapsed().as_millis();
-                if elapsed > 50 {
+                if elapsed > 300 {
                     println!("info depth {} currmove {} currmovenumber {}", depth, m, legal_moves + 1);
                 }
             }
@@ -387,6 +411,15 @@ impl Searcher {
             if !is_pv_node && depth <= 6 && !in_check && is_quiet && !is_promotion && legal_moves > 1 {
                 let margin = 120 * depth as i32 + 50;
                 if static_eval + margin <= alpha {
+                    board.unmake_move(m, state);
+                    continue;
+                }
+            }
+
+            // History Pruning: skip quiet moves with terrible history at shallow depths
+            if !is_pv_node && !in_check && is_quiet && depth <= 3 && legal_moves > 1 {
+                let hist = self.history[board.side_to_move.opposite().idx()][m.from() as usize][m.to() as usize];
+                if hist < -(depth as i32 * depth as i32 * 100) {
                     board.unmake_move(m, state);
                     continue;
                 }
@@ -491,6 +524,13 @@ impl Searcher {
             let stand_pat = if in_check { -INFINITY } else { evaluate(board) };
 
             if stand_pat >= beta { return beta; }
+
+            // Delta Pruning: if even the biggest possible gain can't reach alpha, bail
+            let big_delta = SEE_PIECE_VALUES[4] + DELTA_MARGIN; // Queen value + margin
+            if !in_check && stand_pat + big_delta < alpha {
+                return alpha;
+            }
+
             if stand_pat > alpha { alpha = stand_pat; }
 
             let tt_entry = self.tt.probe(board.hash);
@@ -509,23 +549,23 @@ impl Searcher {
                 }
             }
 
-            let mut moves = if in_check {
-                movegen::generate_evasions(board)
-            } else {
-                movegen::generate_captures(board)
-            };
-
-            let mut scores = self.score_moves(moves.as_slice(), board, tt_move, ply, true);
+            use crate::engine::movepicker::MovePicker;
+            
             let mut legal_moves = 0;
+            let killers = [None, None];
+            let mut picker = MovePicker::new(tt_move, killers, true);
 
-            for i in 0..moves.len() {
-                self.pick_move(moves.as_mut_slice(), &mut scores, i);
-                let m = moves.get(i);
-                let see = scores[i];
-
-                if !in_check && see < 0 { continue; }
-
+            while let Some(m) = picker.next(self, board, ply) {
                 if !board.is_legal(m) { continue; }
+
+                // Delta Pruning per-move: skip captures that can't raise alpha
+                if !in_check {
+                    let captured_pt = board.pieces[m.to() as usize];
+                    let captured_val = SEE_PIECE_VALUES[captured_pt as usize];
+                    if stand_pat + captured_val + DELTA_MARGIN < alpha {
+                        continue;
+                    }
+                }
 
                 let state = board.make_move(m);
                 legal_moves += 1;
@@ -541,7 +581,7 @@ impl Searcher {
             alpha
         }
 
-    fn pick_move(&self, moves: &mut [Move], scores: &mut [i32], start: usize) {
+    pub fn pick_move(&self, moves: &mut [Move], scores: &mut [i32], start: usize) {
         let mut best_idx = start;
         let mut best_score = scores[start];
         for i in start + 1..moves.len() {
@@ -569,7 +609,7 @@ impl Searcher {
         scores
     }
 
-    fn score_move(&self, m: Move, board: &Board, tt_move: Option<Move>, ply: u32, is_qsearch: bool) -> i32 {
+    pub fn score_move(&self, m: Move, board: &Board, tt_move: Option<Move>, ply: u32, is_qsearch: bool) -> i32 {
         if Some(m) == tt_move {
             return 1_000_000;
         }
@@ -578,8 +618,8 @@ impl Searcher {
         let is_promotion = (m.flags() & 0x8) != 0;
 
         if is_capture {
-            let victim = board.pieces[m.to() as usize].unwrap_or(PieceType::Pawn);
-            let attacker = board.pieces[m.from() as usize].unwrap_or(PieceType::Pawn);
+            let victim = board.pieces[m.to() as usize];
+            let attacker = board.pieces[m.from() as usize];
             
             // MVV-LVA base score
             let score = 50_000 + 10 * self.val(victim) - self.val(attacker);
@@ -630,7 +670,7 @@ impl Searcher {
         self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize] / 10
     }
 
-    fn val(&self, pt: PieceType) -> i32 {
+    pub fn val(&self, pt: PieceType) -> i32 {
         match pt {
             PieceType::Pawn => 1,
             PieceType::Knight => 3,
@@ -638,6 +678,7 @@ impl Searcher {
             PieceType::Rook => 5,
             PieceType::Queen => 9,
             PieceType::King => 0,
+            PieceType::Empty => 0,
         }
     }
 
@@ -683,6 +724,46 @@ impl Searcher {
         // Same gravity formula as the bonus path, keeping values bounded.
        *entry = (current + b - (current.abs() * b / 32_768)) as i32;
     }
+
+    fn extract_pv(&self, board: &mut Board) -> Vec<Move> {
+        let mut pv = Vec::new();
+        let mut states = Vec::new();
+        let mut visited = Vec::new();
+
+        // Limit the maximum PV length to prevent overly long extractions
+        let mut max_len = 64;
+
+        while max_len > 0 {
+            if visited.contains(&board.hash) {
+                break;
+            }
+            visited.push(board.hash);
+
+            if let Some(entry) = self.tt.probe(board.hash) {
+                if let Some(m) = entry.best_move {
+                    // Quick legality check to avoid panics on corrupted or colliding TT entries
+                    let pseudo_moves = movegen::generate_pseudo_legal_moves(board);
+                    if !pseudo_moves.as_slice().contains(&m) || !board.is_legal(m) {
+                        break;
+                    }
+                    pv.push(m);
+                    states.push(board.make_move(m));
+                    max_len -= 1;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Unmake moves to restore board state
+        for (m, state) in pv.iter().rev().zip(states.into_iter().rev()) {
+            board.unmake_move(*m, state);
+        }
+
+        pv
+    }
 }
 
 #[cfg(test)]
@@ -690,6 +771,7 @@ mod tests {
     use super::*;
     use crate::board::board::Board;
     use crate::movegen::init_all;
+    use crate::board::piece::Color;
 
     #[test]
     fn test_mate_in_one() {
@@ -710,8 +792,8 @@ mod tests {
             fullmove_number: 1,
             last_move: None,
             history: Vec::new(),
-            pieces: [None; 64],
-            colors: [None; 64],
+            pieces: [PieceType::Empty; 64],
+            colors: [Color::None; 64],
             hash: 0,
         };
         board.put_piece(7, crate::board::piece::PieceType::King, crate::board::piece::Color::White);

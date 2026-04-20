@@ -2,10 +2,11 @@ use crate::board::bitboard::*;
 use crate::board::board::Board;
 use crate::board::r#move::{Move, flags};
 use crate::movegen::move_list::MoveList;
+use crate::movegen::GenType;
 
 pub use crate::magic::{get_bishop_attacks, get_rook_attacks, get_queen_attacks};
 
-pub fn generate_sliding_moves(board: &Board, moves: &mut MoveList, captures_only: bool) {
+pub fn generate_sliding_moves(board: &Board, moves: &mut MoveList, gen_type: GenType) {
     let side = board.side_to_move;
     let own_occ = board.occupancy[side.idx()];
     let enemy_occ = board.occupancy[side.opposite().idx()];
@@ -16,9 +17,7 @@ pub fn generate_sliding_moves(board: &Board, moves: &mut MoveList, captures_only
     while bishops != 0 {
         let from = pop_lsb(&mut bishops);
         let mut attacks = get_bishop_attacks(from, occ) & !own_occ;
-        if captures_only {
-            attacks &= enemy_occ;
-        }
+        match gen_type { GenType::Captures => attacks &= enemy_occ, GenType::Quiets => attacks &= !enemy_occ, GenType::All => {} }
         let mut bb = attacks;
         while bb != 0 {
             let to = pop_lsb(&mut bb);
@@ -32,9 +31,7 @@ pub fn generate_sliding_moves(board: &Board, moves: &mut MoveList, captures_only
     while rooks != 0 {
         let from = pop_lsb(&mut rooks);
         let mut attacks = get_rook_attacks(from, occ) & !own_occ;
-        if captures_only {
-            attacks &= enemy_occ;
-        }
+        match gen_type { GenType::Captures => attacks &= enemy_occ, GenType::Quiets => attacks &= !enemy_occ, GenType::All => {} }
         let mut bb = attacks;
         while bb != 0 {
             let to = pop_lsb(&mut bb);
@@ -48,9 +45,7 @@ pub fn generate_sliding_moves(board: &Board, moves: &mut MoveList, captures_only
     while queens != 0 {
         let from = pop_lsb(&mut queens);
         let mut attacks = get_queen_attacks(from, occ) & !own_occ;
-        if captures_only {
-            attacks &= enemy_occ;
-        }
+        match gen_type { GenType::Captures => attacks &= enemy_occ, GenType::Quiets => attacks &= !enemy_occ, GenType::All => {} }
         let mut bb = attacks;
         while bb != 0 {
             let to = pop_lsb(&mut bb);

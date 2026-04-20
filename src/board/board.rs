@@ -45,8 +45,8 @@ pub struct Board {
     pub history: Vec<u64>,
 
     // Piece at square (optional optimization)
-    pub pieces: [Option<PieceType>; 64],
-    pub colors: [Option<Color>; 64],
+    pub pieces: [PieceType; 64],
+    pub colors: [Color; 64],
 
     // Zobrist hash
     pub hash: u64,
@@ -64,7 +64,7 @@ pub struct UndoState {
     pub castling_rights: u8,
     pub en_passant_square: Option<u8>,
     pub halfmove_clock: u16,
-    pub captured_piece: Option<PieceType>,
+    pub captured_piece: PieceType,
     pub last_move: Option<Move>,
     pub hash: u64,
 }
@@ -88,8 +88,8 @@ impl Board {
             fullmove_number: 1,
             last_move: None,
             history: Vec::with_capacity(128),
-            pieces: [None; 64],
-            colors: [None; 64],
+            pieces: [PieceType::Empty; 64],
+            colors: [Color::None; 64],
             hash: 0,
         };
 
@@ -108,9 +108,10 @@ impl Board {
                 PieceType::Rook => board.rooks[c] |= bb,
                 PieceType::Queen => board.queens[c] |= bb,
                 PieceType::King => board.kings[c] |= bb,
+                PieceType::Empty => {},
             }
-            board.pieces[sq as usize] = Some(pt);
-            board.colors[sq as usize] = Some(color);
+            board.pieces[sq as usize] = pt;
+            board.colors[sq as usize] = color;
         };
 
         // White
@@ -160,8 +161,8 @@ impl Board {
             fullmove_number: 1,
             last_move: None,
             history: Vec::with_capacity(128),
-            pieces: [None; 64],
-            colors: [None; 64],
+            pieces: [PieceType::Empty; 64],
+            colors: [Color::None; 64],
             hash: 0,
         };
 
@@ -257,18 +258,19 @@ impl Board {
 
         // 1. Basic sanity: from square must have our piece
         let moving_color = self.side_to_move;
-        if self.colors[from as usize] != Some(moving_color) {
+        if self.colors[from as usize] != moving_color {
             return false;
         }
 
         // 2. Cannot capture own piece
-        if let Some(color) = self.colors[to as usize] {
+        let color = self.colors[to as usize];
+        if color != Color::None {
             if color == moving_color {
                 return false;
             }
         }
 
-        let pt = self.pieces[from as usize].unwrap();
+        let pt = self.pieces[from as usize];
 
         // 3. Special move handling (castling, en passant, promotion)
         match flags {
@@ -375,7 +377,7 @@ impl Board {
         }
 
         let cap_sq = if side == Color::White { to - 8 } else { to + 8 };
-        if self.pieces[cap_sq as usize] != Some(PieceType::Pawn) {
+        if self.pieces[cap_sq as usize] != PieceType::Pawn {
             return false;
         }
 
@@ -432,7 +434,7 @@ impl Board {
 
         let from = m.from();
         let to = m.to();
-        let pt = self.pieces[from as usize].unwrap();
+        let pt = self.pieces[from as usize];
 
         // King moves are always legal if target is not attacked (must exclude original square from occupancy)
         if pt == PieceType::King {
@@ -447,7 +449,7 @@ impl Board {
 
         // Single check → can capture the checker or block it
         let checker_sq = checkers.trailing_zeros() as u8;
-        let checker_pt = self.pieces[checker_sq as usize].unwrap();
+        let checker_pt = self.pieces[checker_sq as usize];
 
         // Capture the checking piece?
         if to == checker_sq {
@@ -498,7 +500,8 @@ impl Board {
             let mut empty = 0;
             for col in 0..8 {
                 let sq = row * 8 + col;
-                if let Some(pt) = self.pieces[sq as usize] {
+                let pt = self.pieces[sq as usize];
+                if pt != PieceType::Empty {
                     if empty > 0 {
                         fen.push_str(&empty.to_string());
                         empty = 0;
@@ -510,8 +513,9 @@ impl Board {
                         PieceType::Rook => 'r',
                         PieceType::Queen => 'q',
                         PieceType::King => 'k',
+                        PieceType::Empty => '.',
                     };
-                    if self.colors[sq as usize] == Some(Color::White) {
+                    if self.colors[sq as usize] == Color::White {
                         c = c.to_ascii_uppercase();
                     }
                     fen.push(c);
@@ -532,6 +536,7 @@ impl Board {
         fen.push(match self.side_to_move {
             Color::White => 'w',
             Color::Black => 'b',
+            Color::None => '-',
         });
 
         // 3. Castling rights
@@ -573,7 +578,8 @@ impl Board {
             print!("{} | ", row + 1);
             for col in 0..8 {
                 let sq = row * 8 + col;
-                if let Some(pt) = self.pieces[sq as usize] {
+                let pt = self.pieces[sq as usize];
+                if pt != PieceType::Empty {
                     let mut c = match pt {
                         PieceType::Pawn => 'p',
                         PieceType::Knight => 'n',
@@ -581,8 +587,9 @@ impl Board {
                         PieceType::Rook => 'r',
                         PieceType::Queen => 'q',
                         PieceType::King => 'k',
+                        PieceType::Empty => '.',
                     };
-                    if self.colors[sq as usize] == Some(Color::White) {
+                    if self.colors[sq as usize] == Color::White {
                         c = c.to_ascii_uppercase();
                     }
                     print!("{} ", c);
@@ -650,9 +657,10 @@ impl Board {
             PieceType::Rook => self.rooks[c] &= mask,
             PieceType::Queen => self.queens[c] &= mask,
             PieceType::King => self.kings[c] &= mask,
+            PieceType::Empty => {},
         }
-        self.pieces[sq as usize] = None;
-        self.colors[sq as usize] = None;
+        self.pieces[sq as usize] = PieceType::Empty;
+        self.colors[sq as usize] = Color::None;
         self.hash ^= ZOBRIST.hash_piece(color, pt, sq);
 
         self.occupancy[c] &= mask;
@@ -670,9 +678,10 @@ impl Board {
             PieceType::Rook => self.rooks[c] |= bb,
             PieceType::Queen => self.queens[c] |= bb,
             PieceType::King => self.kings[c] |= bb,
+            PieceType::Empty => {},
         }
-        self.pieces[sq as usize] = Some(pt);
-        self.colors[sq as usize] = Some(color);
+        self.pieces[sq as usize] = pt;
+        self.colors[sq as usize] = color;
         self.hash ^= ZOBRIST.hash_piece(color, pt, sq);
 
         self.occupancy[c] |= bb;
@@ -699,15 +708,15 @@ impl Board {
            self.last_move = Some(m);
 
            // 1. Identify moving piece
-           let pt = self.pieces[from as usize].expect("Move from empty square");
+           let pt = self.pieces[from as usize];
 
            // 2. Handle captures
            if f == flags::EN_PASSANT {
                let cap_sq = if side == Color::White { to - 8 } else { to + 8 };
                self.remove_piece(cap_sq, PieceType::Pawn, enemy);
            } else if (f & flags::CAPTURE) != 0 {
-               if let Some(cap_pt) = state.captured_piece {
-                   self.remove_piece(to, cap_pt, enemy);
+               if state.captured_piece != PieceType::Empty {
+                   self.remove_piece(to, state.captured_piece, enemy);
                }
            }
 
@@ -806,7 +815,7 @@ impl Board {
         let f = m.flags();
 
         // 1. Identify piece that was moved (it's currently at 'to')
-        let pt = self.pieces[to as usize].expect("Unmake to empty square");
+        let pt = self.pieces[to as usize];
         
         // 2. Remove from 'to'
         self.remove_piece_no_hash(to, pt, side);
@@ -819,8 +828,8 @@ impl Board {
         if f == flags::EN_PASSANT {
             let cap_sq = if side == Color::White { to - 8 } else { to + 8 };
             self.put_piece_no_hash(cap_sq, PieceType::Pawn, enemy);
-        } else if let Some(cap_pt) = state.captured_piece {
-            self.put_piece_no_hash(to, cap_pt, enemy);
+        } else if state.captured_piece != PieceType::Empty {
+            self.put_piece_no_hash(to, state.captured_piece, enemy);
         }
 
         // 5. Handle Castling
@@ -848,7 +857,7 @@ impl Board {
             castling_rights: self.castling_rights,
             en_passant_square: self.en_passant_square,
             halfmove_clock: self.halfmove_clock,
-            captured_piece: None,
+            captured_piece: PieceType::Empty,
             last_move: self.last_move,
             hash: self.hash,
         };
@@ -891,9 +900,10 @@ impl Board {
             PieceType::Rook => self.rooks[c] &= mask,
             PieceType::Queen => self.queens[c] &= mask,
             PieceType::King => self.kings[c] &= mask,
+            PieceType::Empty => {},
         }
-        self.pieces[sq as usize] = None;
-        self.colors[sq as usize] = None;
+        self.pieces[sq as usize] = PieceType::Empty;
+        self.colors[sq as usize] = Color::None;
 
         self.occupancy[c] &= mask;
         self.all_occupancy &= mask;
@@ -909,9 +919,10 @@ impl Board {
             PieceType::Rook => self.rooks[c] |= bb,
             PieceType::Queen => self.queens[c] |= bb,
             PieceType::King => self.kings[c] |= bb,
+            PieceType::Empty => {},
         }
-        self.pieces[sq as usize] = Some(pt);
-        self.colors[sq as usize] = Some(color);
+        self.pieces[sq as usize] = pt;
+        self.colors[sq as usize] = color;
 
         self.occupancy[c] |= bb;
         self.all_occupancy |= bb;
@@ -989,8 +1000,8 @@ impl Board {
         let mut gain = [0i32; 32];
         let mut d = 0;
         
-        let mut attacker_pt = self.pieces[from as usize].unwrap_or(PieceType::Pawn);
-        gain[d] = self.see_value(self.pieces[to as usize].unwrap_or(PieceType::Pawn));
+        let mut attacker_pt = self.pieces[from as usize];
+        gain[d] = self.see_value(self.pieces[to as usize]);
         
         let mut occ = self.all_occupancy;
         let mut attackers = self.all_attackers_to(to, occ);
@@ -1016,7 +1027,7 @@ impl Board {
             let attacker_sq = self.least_valuable_attacker(attackers, side);
             if attacker_sq == 64 { break; }
             
-            attacker_pt = self.pieces[attacker_sq as usize].unwrap();
+            attacker_pt = self.pieces[attacker_sq as usize];
             gain[d] = self.see_value(attacker_pt) - gain[d - 1];
             
             if gain[d].max(gain[d-1]) < 0 { break; } // Optimization
@@ -1052,6 +1063,7 @@ impl Board {
             PieceType::Rook => 500,
             PieceType::Queen => 900,
             PieceType::King => 20000,
+            PieceType::Empty => 0,
         }
     }
 
@@ -1141,8 +1153,9 @@ impl Board {
     pub fn compute_hash(&self) -> u64 {
         let mut h = 0u64;
         for sq in 0..64 {
-            if let Some(pt) = self.pieces[sq] {
-                h ^= ZOBRIST.hash_piece(self.colors[sq].unwrap(), pt, sq as u8);
+            let pt = self.pieces[sq];
+            if pt != PieceType::Empty {
+                h ^= ZOBRIST.hash_piece(self.colors[sq], pt, sq as u8);
             }
         }
         if self.side_to_move == Color::Black {
@@ -1184,8 +1197,8 @@ mod tests {
         let m = Move::new(12, 28, flags::DOUBLE_PAWN);
         let _state = b.make_move(m);
 
-        assert_eq!(b.pieces[12], None);
-        assert_eq!(b.pieces[28], Some(PieceType::Pawn));
+        assert_eq!(b.pieces[12], PieceType::Empty);
+        assert_eq!(b.pieces[28], PieceType::Pawn);
         assert_eq!(b.en_passant_square, Some(20));
         assert_eq!(b.side_to_move, Color::Black);
     }

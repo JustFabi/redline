@@ -1,6 +1,8 @@
 use crate::board::board::Board;
 use crate::board::piece::Color;
-use crate::board::bitboard::count_bits;
+use crate::board::bitboard::{count_bits, bit, pop_lsb};
+use crate::movegen::knight::get_knight_attacks;
+use crate::movegen::pawn::get_pawn_attacks;
 
 // PeSTO Base Piece Values (Midgame, Endgame)
 pub const MG_VALUE: [i32; 6] = [82, 337, 365, 477, 1025, 0];
@@ -195,10 +197,211 @@ pub fn evaluate(board: &Board) -> i32 {
     }
 
     let phase = phase.min(24);
-    let phase = (phase * 256 + 12) / 24;
-    let score = ((midgame * phase) + (endgame * (256 - phase))) / 256;
+    let phase_weight = (phase * 256 + 12) / 24;
+
+    // ===== King Safety =====
+    let mut king_safety = [0i32; 2];
+    for color in [Color::White, Color::Black] {
+        let us = color.idx();
+        let them = color.opposite().idx();
+        let king_bb = board.kings[us];
+        if king_bb == 0 { continue; }
+        let king_sq = king_bb.trailing_zeros() as u8;
+        let king_ring = king_zone(king_sq);
+
+        let mut attackers = 0i32;
+        let mut attack_weight = 0i32;
+
+        // Enemy knights attacking king ring
+        let mut knights = board.knights[them];
+        while knights != 0 {
+            let sq = pop_lsb(&mut knights);
+            let attacks = get_knight_attacks(sq);
+            if (attacks & king_ring) != 0 {
+                attackers += 1;
+                attack_weight += 40;
+            }
+        }
+
+        // Enemy bishops/queens on diagonals near king
+        let bishop_queen = board.bishops[them] | board.queens[them];
+        if (bishop_queen & king_ring) != 0 {
+            attackers += 1;
+            attack_weight += 60;
+        }
+
+        // Enemy rooks/queens on files near king
+        let rook_queen = board.rooks[them] | board.queens[them];
+        let king_file_mask = 0x0101010101010101u64 << (king_sq % 8);
+        if (rook_queen & king_file_mask) != 0 {
+            attackers += 1;
+            attack_weight += 40;
+        }
+
+        // Enemy pawns attacking king ring
+        let mut enemy_pawns = board.pawns[them];
+        while enemy_pawns != 0 {
+            let sq = pop_lsb(&mut enemy_pawns);
+            let atk = get_pawn_attacks(sq, color.opposite());
+            if (atk & king_ring) != 0 {
+                attackers += 1;
+                attack_weight += 20;
+            }
+        }
+
+        // Scale by attacker count: more attackers = disproportionately more danger
+        let safety_penalty = match attackers {
+            0 => 0,
+            1 => attack_weight / 4,
+            2 => attack_weight / 2,
+            _ => attack_weight,
+        };
+        king_safety[us] = -safety_penalty;
+    }
+
+    // ===== Pawn Structure =====
+    let mut pawn_bonus = [0i32; 2];
+    for color in [Color::White, Color::Black] {
+        let us = color.idx();
+        let them = color.opposite().idx();
+        let our_pawns = board.pawns[us];
+        let their_pawns = board.pawns[them];
+
+        let mut pawns = our_pawns;
+        while pawns != 0 {
+            let sq = pop_lsb(&mut pawns);
+            let file = sq % 8;
+            let rank = sq / 8;
+
+            // Passed pawn: no enemy pawns on same or adjacent files ahead
+            let ahead_mask = passed_pawn_mask(color, sq);
+            if (their_pawns & ahead_mask) == 0 {
+                // Bonus scales with how far advanced
+                let advance = if color == Color::White { rank } else { 7 - rank };
+                let passed_bonus = match advance {
+                    6 => 120,
+                    5 => 80,
+                    4 => 50,
+                    3 => 30,
+                    2 => 15,
+                    _ => 5,
+                };
+                pawn_bonus[us] += passed_bonus;
+            }
+
+            // Isolated pawn: no friendly pawns on adjacent files
+            let adj_mask = adjacent_files_mask(file);
+            if (our_pawns & adj_mask) == 0 {
+                pawn_bonus[us] -= 15;
+            }
+
+            // Doubled pawn: another friendly pawn on the same file
+            let file_mask = 0x0101010101010101u64 << file;
+            if count_bits(our_pawns & file_mask) > 1 {
+                pawn_bonus[us] -= 10;
+            }
+        }
+    }
+
+    // ===== Mobility (simple: count legal knight + bishop moves) =====
+    let mut mobility_score = 0i32;
+    for color in [Color::White, Color::Black] {
+        let us = color.idx();
+        let multiplier = if color == Color::White { 1 } else { -1 };
+        let own_occ = board.occupancy[us];
+
+        // Knight mobility
+        let mut knights = board.knights[us];
+        while knights != 0 {
+            let sq = pop_lsb(&mut knights);
+            let moves = get_knight_attacks(sq) & !own_occ;
+            mobility_score += multiplier * (count_bits(moves) as i32 - 4) * 4; // 4cp per move above/below 4
+        }
+
+        // Bishop mobility (use magic sliders)
+        let mut bishops = board.bishops[us];
+        while bishops != 0 {
+            let sq = pop_lsb(&mut bishops);
+            let moves = crate::magic::get_bishop_attacks(sq, board.all_occupancy) & !own_occ;
+            mobility_score += multiplier * (count_bits(moves) as i32 - 7) * 5; // 5cp per move above/below 7
+        }
+
+        // Rook mobility
+        let mut rooks = board.rooks[us];
+        while rooks != 0 {
+            let sq = pop_lsb(&mut rooks);
+            let moves = crate::magic::get_rook_attacks(sq, board.all_occupancy) & !own_occ;
+            mobility_score += multiplier * (count_bits(moves) as i32 - 7) * 3;
+        }
+    }
+
+    // ===== Bishop Pair Bonus =====
+    let mut bishop_pair = 0i32;
+    if count_bits(board.bishops[0]) >= 2 { bishop_pair += 30; }
+    if count_bits(board.bishops[1]) >= 2 { bishop_pair -= 30; }
+
+    // ===== Combine =====
+    let pst_score = ((midgame * phase_weight) + (endgame * (256 - phase_weight))) / 256;
+
+    let ks_white = king_safety[0];
+    let ks_black = king_safety[1];
+    let king_safety_total = ks_white - ks_black;
+
+    let pawn_total = pawn_bonus[0] as i32 - pawn_bonus[1] as i32;
+
+    let score = pst_score + king_safety_total + pawn_total + mobility_score + bishop_pair;
 
     if board.side_to_move == Color::White { score } else { -score }
+}
+
+/// Generate a king zone mask: the 3x3 area around the king + 3 squares in front
+fn king_zone(king_sq: u8) -> u64 {
+    let mut zone = 0u64;
+    let rank = (king_sq / 8) as i32;
+    let file = (king_sq % 8) as i32;
+    for dr in -1..=2 {
+        for df in -1..=1 {
+            let r = rank + dr;
+            let f = file + df;
+            if r >= 0 && r < 8 && f >= 0 && f < 8 {
+                zone |= bit((r * 8 + f) as u8);
+            }
+        }
+    }
+    zone
+}
+
+/// Generate a passed pawn mask: all squares on same and adjacent files ahead of sq
+fn passed_pawn_mask(color: Color, sq: u8) -> u64 {
+    let file = sq % 8;
+    let rank = sq / 8;
+    let mut mask = 0u64;
+
+    let files = if file == 0 { vec![0, 1] }
+                else if file == 7 { vec![6, 7] }
+                else { vec![file - 1, file, file + 1] };
+
+    for &f in &files {
+        for r in 0..8u8 {
+            let ahead = if color == Color::White { r > rank } else { r < rank };
+            if ahead {
+                mask |= bit(r * 8 + f);
+            }
+        }
+    }
+    mask
+}
+
+/// Mask of all squares on files adjacent to `file` (not including `file` itself)
+fn adjacent_files_mask(file: u8) -> u64 {
+    let mut mask = 0u64;
+    if file > 0 {
+        mask |= 0x0101010101010101u64 << (file - 1);
+    }
+    if file < 7 {
+        mask |= 0x0101010101010101u64 << (file + 1);
+    }
+    mask
 }
 
 #[cfg(test)]

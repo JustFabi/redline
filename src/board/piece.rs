@@ -5,6 +5,7 @@
 pub enum Color {
     White = 0,
     Black = 1,
+    None = 2,
 }
 
 impl Color {
@@ -13,6 +14,7 @@ impl Color {
         match self {
             Color::White => Color::Black,
             Color::Black => Color::White,
+            Color::None => Color::None,
         }
     }
 
@@ -31,6 +33,7 @@ pub enum PieceType {
     Rook = 3,
     Queen = 4,
     King = 5,
+    Empty = 6,
 }
 
 impl PieceType {
@@ -38,4 +41,4 @@ impl PieceType {
     pub fn idx(self) -> usize {
         self as usize
     }
-}
+}

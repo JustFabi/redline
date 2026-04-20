@@ -4,6 +4,7 @@ use crate::board::bitboard::*;
 use crate::board::board::Board;
 use crate::board::r#move::{Move, flags};
 use crate::movegen::move_list::MoveList;
+use crate::movegen::GenType;
 
 /// Precomputed knight attack table
 /// Each index = square
@@ -53,7 +54,7 @@ pub fn get_knight_attacks(square: u8) -> u64 {
 }
 
 /// Generate all knight moves for current side
-pub fn generate_knight_moves(board: &Board, moves: &mut MoveList, captures_only: bool) {
+pub fn generate_knight_moves(board: &Board, moves: &mut MoveList, gen_type: GenType) {
     let side = board.side_to_move;
     let own_occ = board.occupancy[side.idx()];
     let enemy_occ = board.occupancy[side.opposite().idx()];
@@ -70,9 +71,7 @@ pub fn generate_knight_moves(board: &Board, moves: &mut MoveList, captures_only:
         // Remove squares occupied by own pieces
         let mut bb = attacks & !own_occ;
 
-        if captures_only {
-            bb &= enemy_occ;
-        }
+        match gen_type { GenType::Captures => bb &= enemy_occ, GenType::Quiets => bb &= !enemy_occ, GenType::All => {} }
 
         while bb != 0 {
             let to = pop_lsb(&mut bb);
@@ -109,7 +108,7 @@ mod tests {
         let board = Board::startpos();
         let mut moves = MoveList::new();
 
-        generate_knight_moves(&board, &mut moves, false);
+        generate_knight_moves(&board, &mut moves, GenType::All);
 
         // In starting position: 2 knights → 4 moves total
         assert_eq!(moves.len(), 4);

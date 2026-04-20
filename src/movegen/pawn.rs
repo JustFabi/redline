@@ -5,6 +5,7 @@ use crate::board::board::Board;
 use crate::board::piece::Color;
 use crate::board::r#move::{Move, flags};
 use crate::movegen::move_list::MoveList;
+use crate::movegen::GenType;
 
 static mut PAWN_ATTACKS: [[u64; 64]; 2] = [[0; 64]; 2];
 
@@ -26,17 +27,18 @@ pub fn get_pawn_attacks(sq: u8, color: Color) -> u64 {
 /// Generates all pawn moves for the current side
 ///
 /// Moves are pushed into `moves` vector
-pub fn generate_pawn_moves(board: &Board, moves: &mut MoveList, captures_only: bool) {
+pub fn generate_pawn_moves(board: &Board, moves: &mut MoveList, gen_type: GenType) {
     match board.side_to_move {
-        Color::White => generate_white_pawns(board, moves, captures_only),
-        Color::Black => generate_black_pawns(board, moves, captures_only),
+        Color::White => generate_white_pawns(board, moves, gen_type),
+        Color::Black => generate_black_pawns(board, moves, gen_type),
+        Color::None => {},
     }
 }
 
 /// =======================
 /// WHITE PAWNS
 /// =======================
-fn generate_white_pawns(board: &Board, moves: &mut MoveList, captures_only: bool) {
+fn generate_white_pawns(board: &Board, moves: &mut MoveList, gen_type: GenType) {
     let pawns = board.pawns[Color::White.idx()];
     let empty = !board.all_occupancy;
     let enemy = board.occupancy[Color::Black.idx()];
@@ -46,7 +48,7 @@ fn generate_white_pawns(board: &Board, moves: &mut MoveList, captures_only: bool
 
     let single_push = (pawns << 8) & empty;
 
-    if !captures_only {
+    if gen_type != GenType::Captures {
         // =========================
         // Single pushes (1 square forward)
         // =========================
@@ -73,68 +75,70 @@ fn generate_white_pawns(board: &Board, moves: &mut MoveList, captures_only: bool
         let to = pop_lsb(&mut bb);
         let from = to - 8;
         moves.push(Move::new(from, to, flags::PROMOTE_QUEEN));
-        if !captures_only {
+        if gen_type != GenType::Captures {
             moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT));
             moves.push(Move::new(from, to, flags::PROMOTE_BISHOP));
             moves.push(Move::new(from, to, flags::PROMOTE_ROOK));
         }
     }
 
-    // =========================
-    // Captures (left)
-    // =========================
-    let capture_left = (pawns << 7) & enemy & !0x8080808080808080;
+    if gen_type != GenType::Quiets {
+        // =========================
+        // Captures (left)
+        // =========================
+        let capture_left = (pawns << 7) & enemy & !0x8080808080808080;
 
-    let mut bb = capture_left & !rank8;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        moves.push(Move::new(to - 7, to, flags::CAPTURE));
-    }
-
-    let mut bb = capture_left & rank8;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        let from = to - 7;
-        moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_BISHOP_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_ROOK_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_QUEEN_CAPTURE));
-    }
-
-    // =========================
-    // Captures (right)
-    // =========================
-    let capture_right = (pawns << 9) & enemy & !0x0101010101010101;
-
-    let mut bb = capture_right & !rank8;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        moves.push(Move::new(to - 9, to, flags::CAPTURE));
-    }
-
-    let mut bb = capture_right & rank8;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        let from = to - 9;
-        moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_BISHOP_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_ROOK_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_QUEEN_CAPTURE));
-    }
-
-    // =========================
-    // En Passant
-    // =========================
-    if let Some(to) = board.en_passant_square {
-        let bit = bit(to);
-        let from_left = bit >> 7;
-        if (from_left & pawns & !0x0101010101010101) != 0 {
-            moves.push(Move::new(to - 7, to, flags::EN_PASSANT));
+        let mut bb = capture_left & !rank8;
+        while bb != 0 {
+            let to = pop_lsb(&mut bb);
+            moves.push(Move::new(to - 7, to, flags::CAPTURE));
         }
 
-        let from_right = bit >> 9;
-        if (from_right & pawns & !0x8080808080808080) != 0 {
-            moves.push(Move::new(to - 9, to, flags::EN_PASSANT));
+        let mut bb = capture_left & rank8;
+        while bb != 0 {
+            let to = pop_lsb(&mut bb);
+            let from = to - 7;
+            moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_BISHOP_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_ROOK_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_QUEEN_CAPTURE));
+        }
+
+        // =========================
+        // Captures (right)
+        // =========================
+        let capture_right = (pawns << 9) & enemy & !0x0101010101010101;
+
+        let mut bb = capture_right & !rank8;
+        while bb != 0 {
+            let to = pop_lsb(&mut bb);
+            moves.push(Move::new(to - 9, to, flags::CAPTURE));
+        }
+
+        let mut bb = capture_right & rank8;
+        while bb != 0 {
+            let to = pop_lsb(&mut bb);
+            let from = to - 9;
+            moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_BISHOP_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_ROOK_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_QUEEN_CAPTURE));
+        }
+
+        // =========================
+        // En Passant
+        // =========================
+        if let Some(to) = board.en_passant_square {
+            let bit = bit(to);
+            let from_left = bit >> 7;
+            if (from_left & pawns & !0x0101010101010101) != 0 {
+                moves.push(Move::new(to - 7, to, flags::EN_PASSANT));
+            }
+
+            let from_right = bit >> 9;
+            if (from_right & pawns & !0x8080808080808080) != 0 {
+                moves.push(Move::new(to - 9, to, flags::EN_PASSANT));
+            }
         }
     }
 }
@@ -142,7 +146,7 @@ fn generate_white_pawns(board: &Board, moves: &mut MoveList, captures_only: bool
 /// =======================
 /// BLACK PAWNS
 /// =======================
-fn generate_black_pawns(board: &Board, moves: &mut MoveList, captures_only: bool) {
+fn generate_black_pawns(board: &Board, moves: &mut MoveList, gen_type: GenType) {
     let pawns = board.pawns[Color::Black.idx()];
     let empty = !board.all_occupancy;
     let enemy = board.occupancy[Color::White.idx()];
@@ -152,7 +156,7 @@ fn generate_black_pawns(board: &Board, moves: &mut MoveList, captures_only: bool
 
     let single_push = (pawns >> 8) & empty;
 
-    if !captures_only {
+    if gen_type != GenType::Captures {
         // =========================
         // Single pushes
         // =========================
@@ -179,69 +183,71 @@ fn generate_black_pawns(board: &Board, moves: &mut MoveList, captures_only: bool
         let to = pop_lsb(&mut bb);
         let from = to + 8;
         moves.push(Move::new(from, to, flags::PROMOTE_QUEEN));
-        if !captures_only {
+        if gen_type != GenType::Captures {
             moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT));
             moves.push(Move::new(from, to, flags::PROMOTE_BISHOP));
             moves.push(Move::new(from, to, flags::PROMOTE_ROOK));
         }
     }
 
-    // =========================
-    // Captures (left)
-    // =========================
-    let capture_left = (pawns >> 9) & enemy & !0x8080808080808080;
+    if gen_type != GenType::Quiets {
+        // =========================
+        // Captures (left)
+        // =========================
+        let capture_left = (pawns >> 9) & enemy & !0x8080808080808080;
 
-    let mut bb = capture_left & !rank1;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        moves.push(Move::new(to + 9, to, flags::CAPTURE));
-    }
-
-    let mut bb = capture_left & rank1;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        let from = to + 9;
-        moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_BISHOP_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_ROOK_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_QUEEN_CAPTURE));
-    }
-
-    // =========================
-    // Captures (right)
-    // =========================
-    let capture_right = (pawns >> 7) & enemy & !0x0101010101010101;
-
-    let mut bb = capture_right & !rank1;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        moves.push(Move::new(to + 7, to, flags::CAPTURE));
-    }
-
-    let mut bb = capture_right & rank1;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        let from = to + 7;
-        moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_BISHOP_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_ROOK_CAPTURE));
-        moves.push(Move::new(from, to, flags::PROMOTE_QUEEN_CAPTURE));
-    }
-
-    // =========================
-    // En Passant
-    // =========================
-    if let Some(to) = board.en_passant_square {
-        let bit = bit(to);
-
-        let from_left = bit << 9;
-        if (from_left & pawns & !0x0101010101010101) != 0 {
-            moves.push(Move::new(to + 9, to, flags::EN_PASSANT));
+        let mut bb = capture_left & !rank1;
+        while bb != 0 {
+            let to = pop_lsb(&mut bb);
+            moves.push(Move::new(to + 9, to, flags::CAPTURE));
         }
 
-        let from_right = bit << 7;
-        if (from_right & pawns & !0x8080808080808080) != 0 {
-            moves.push(Move::new(to + 7, to, flags::EN_PASSANT));
+        let mut bb = capture_left & rank1;
+        while bb != 0 {
+            let to = pop_lsb(&mut bb);
+            let from = to + 9;
+            moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_BISHOP_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_ROOK_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_QUEEN_CAPTURE));
+        }
+
+        // =========================
+        // Captures (right)
+        // =========================
+        let capture_right = (pawns >> 7) & enemy & !0x0101010101010101;
+
+        let mut bb = capture_right & !rank1;
+        while bb != 0 {
+            let to = pop_lsb(&mut bb);
+            moves.push(Move::new(to + 7, to, flags::CAPTURE));
+        }
+
+        let mut bb = capture_right & rank1;
+        while bb != 0 {
+            let to = pop_lsb(&mut bb);
+            let from = to + 7;
+            moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_BISHOP_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_ROOK_CAPTURE));
+            moves.push(Move::new(from, to, flags::PROMOTE_QUEEN_CAPTURE));
+        }
+
+        // =========================
+        // En Passant
+        // =========================
+        if let Some(to) = board.en_passant_square {
+            let bit = bit(to);
+
+            let from_left = bit << 9;
+            if (from_left & pawns & !0x0101010101010101) != 0 {
+                moves.push(Move::new(to + 9, to, flags::EN_PASSANT));
+            }
+
+            let from_right = bit << 7;
+            if (from_right & pawns & !0x8080808080808080) != 0 {
+                moves.push(Move::new(to + 7, to, flags::EN_PASSANT));
+            }
         }
     }
 }
@@ -256,7 +262,7 @@ mod tests {
         let board = Board::startpos();
         let mut moves = MoveList::new();
 
-        generate_pawn_moves(&board, &mut moves, false);
+        generate_pawn_moves(&board, &mut moves, GenType::All);
 
         // In starting position:
         // 8 single pushes + 8 double pushes = 16 moves
@@ -269,7 +275,7 @@ mod tests {
         board.side_to_move = Color::Black;
 
         let mut moves = MoveList::new();
-        generate_pawn_moves(&board, &mut moves, false);
+        generate_pawn_moves(&board, &mut moves, GenType::All);
 
         assert_eq!(moves.len(), 16);
     }

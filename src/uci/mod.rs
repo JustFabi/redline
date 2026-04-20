@@ -48,6 +48,9 @@ impl Uci {
             "uci" => vec![
                 "id name Redline".into(),
                 "id author Fabian Merkl".into(),
+                "".into(),
+                "option name Hash type spin default 64 min 1 max 4096".into(),
+                "option name Threads type spin default 1 min 1 max 128".into(),
                 "uciok".into(),
             ],
             "isready" => vec!["readyok".into()],

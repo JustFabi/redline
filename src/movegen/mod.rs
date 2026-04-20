@@ -16,21 +16,37 @@ pub fn init_all() {
     crate::magic::init_magics();
 }
 
+#[derive(PartialEq, Clone, Copy)]
+pub enum GenType {
+    All,
+    Captures,
+    Quiets,
+}
+
     pub fn generate_pseudo_legal_moves(board: &Board) -> MoveList {
         let mut moves = MoveList::new();
-        pawn::generate_pawn_moves(board, &mut moves, false);
-        knight::generate_knight_moves(board, &mut moves, false);
-        sliding::generate_sliding_moves(board, &mut moves, false);
-        king::generate_king_moves(board, &mut moves, false);
+        pawn::generate_pawn_moves(board, &mut moves, GenType::All);
+        knight::generate_knight_moves(board, &mut moves, GenType::All);
+        sliding::generate_sliding_moves(board, &mut moves, GenType::All);
+        king::generate_king_moves(board, &mut moves, GenType::All);
         moves
     }
 
     pub fn generate_captures(board: &Board) -> MoveList {
         let mut moves = MoveList::new();
-        pawn::generate_pawn_moves(board, &mut moves, true);
-        knight::generate_knight_moves(board, &mut moves, true);
-        sliding::generate_sliding_moves(board, &mut moves, true);
-        king::generate_king_moves(board, &mut moves, true);
+        pawn::generate_pawn_moves(board, &mut moves, GenType::Captures);
+        knight::generate_knight_moves(board, &mut moves, GenType::Captures);
+        sliding::generate_sliding_moves(board, &mut moves, GenType::Captures);
+        king::generate_king_moves(board, &mut moves, GenType::Captures);
+        moves
+    }
+
+    pub fn generate_quiets(board: &Board) -> MoveList {
+        let mut moves = MoveList::new();
+        pawn::generate_pawn_moves(board, &mut moves, GenType::Quiets);
+        knight::generate_knight_moves(board, &mut moves, GenType::Quiets);
+        sliding::generate_sliding_moves(board, &mut moves, GenType::Quiets);
+        king::generate_king_moves(board, &mut moves, GenType::Quiets);
         moves
     }
 
@@ -42,7 +58,7 @@ pub fn init_all() {
         let num_checkers = count_bits(checkers);
 
         // 1. King moves
-        king::generate_king_moves(board, &mut moves, false);
+        king::generate_king_moves(board, &mut moves, GenType::All);
 
         // 2. If single check, we can block or capture
         if num_checkers == 1 {
@@ -50,9 +66,9 @@ pub fn init_all() {
             let target_mask = bit(checker_sq) | board.between(king_sq, checker_sq);
             
             let mut all_pseudo = MoveList::new();
-            pawn::generate_pawn_moves(board, &mut all_pseudo, false);
-            knight::generate_knight_moves(board, &mut all_pseudo, false);
-            sliding::generate_sliding_moves(board, &mut all_pseudo, false);
+            pawn::generate_pawn_moves(board, &mut all_pseudo, GenType::All);
+            knight::generate_knight_moves(board, &mut all_pseudo, GenType::All);
+            sliding::generate_sliding_moves(board, &mut all_pseudo, GenType::All);
 
             for i in 0..all_pseudo.len() {
                 let m = all_pseudo.get(i);
@@ -200,8 +216,8 @@ mod tests {
             fullmove_number: 1,
             last_move: None,
             history: Vec::new(),
-            pieces: [None; 64],
-            colors: [None; 64],
+            pieces: [PieceType::Empty; 64],
+            colors: [Color::None; 64],
             hash: 0,
         };
         // White: Kh1, Qc7

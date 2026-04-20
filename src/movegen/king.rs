@@ -3,6 +3,7 @@ use crate::board::board::{Board, castling};
 use crate::board::piece::Color;
 use crate::board::r#move::{Move, flags};
 use crate::movegen::move_list::MoveList;
+use crate::movegen::GenType;
 
 static mut KING_ATTACKS: [u64; 64] = [0; 64];
 
@@ -38,7 +39,7 @@ pub fn get_king_attacks(square: u8) -> u64 {
     unsafe { KING_ATTACKS[square as usize] }
 }
 
-pub fn generate_king_moves(board: &Board, moves: &mut MoveList, captures_only: bool) {
+pub fn generate_king_moves(board: &Board, moves: &mut MoveList, gen_type: GenType) {
     let side = board.side_to_move;
     let own_occ = board.occupancy[side.idx()];
     let enemy_occ = board.occupancy[side.opposite().idx()];
@@ -49,9 +50,7 @@ pub fn generate_king_moves(board: &Board, moves: &mut MoveList, captures_only: b
     let attacks = get_king_attacks(from);
     let mut bb = attacks & !own_occ;
 
-    if captures_only {
-        bb &= enemy_occ;
-    }
+    match gen_type { GenType::Captures => bb &= enemy_occ, GenType::Quiets => bb &= !enemy_occ, GenType::All => {} }
 
     while bb != 0 {
         let to = pop_lsb(&mut bb);
@@ -60,7 +59,7 @@ pub fn generate_king_moves(board: &Board, moves: &mut MoveList, captures_only: b
     }
 
     // Castling
-    if !captures_only {
+    if gen_type != GenType::Captures {
         generate_castling_moves(board, moves);
     }
 }
