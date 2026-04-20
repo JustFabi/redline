@@ -291,6 +291,11 @@ impl Board {
         if !self.is_in_check(moving_color) {
             let (pinned, _) = self.pins_and_checkers(moving_color);
 
+            if pt == PieceType::King {
+                let occ = self.all_occupancy ^ bit(from);
+                return !self.is_square_attacked_with_occ(to, moving_color.opposite(), occ);
+            }
+
             // If the piece is not pinned, the move is legal (we already checked basic validity)
             if (pinned & bit(from)) == 0 {
                 return true;
@@ -318,7 +323,7 @@ impl Board {
             return false;
         }
 
-        let (king_to, rook_from, rook_to) = if flags == flags::KING_CASTLE {
+        let (king_to, _rook_from, _rook_to) = if flags == flags::KING_CASTLE {
             if side == Color::White { (6, 7, 5) } else { (62, 63, 61) }
         } else {
             if side == Color::White { (2, 0, 3) } else { (58, 56, 59) }
@@ -365,7 +370,6 @@ impl Board {
         let to = m.to();
         let from = m.from();
 
-        // Must have en passant target
         if self.en_passant_square != Some(to) {
             return false;
         }
@@ -375,10 +379,29 @@ impl Board {
             return false;
         }
 
-        // Simulate the capture and check if king is safe
-        let mut board = self.clone(); // rare path → acceptable cost
-        let _ = board.make_move(m);
-        !board.is_in_check(side)
+        let king_sq = self.kings[side.idx()].trailing_zeros() as u8;
+        let occ = self.all_occupancy ^ bit(from) ^ bit(cap_sq) | bit(to);
+        let enemy = side.opposite();
+        let e_idx = enemy.idx();
+        
+        // 1. Sliding attacks with new occupancy
+        let rooks_queens = self.rooks[e_idx] | self.queens[e_idx];
+        let bishops_queens = self.bishops[e_idx] | self.queens[e_idx];
+        
+        if (crate::magic::get_rook_attacks(king_sq, occ) & rooks_queens) != 0 { return false; }
+        if (crate::magic::get_bishop_attacks(king_sq, occ) & bishops_queens) != 0 { return false; }
+        
+        // 2. Knight attacks
+        if (crate::movegen::knight::get_knight_attacks(king_sq) & self.knights[e_idx]) != 0 { return false; }
+        
+        // 3. Pawn attacks (enemy pawns EXCEPT the captured one)
+        let enemy_pawns = self.pawns[e_idx] & !bit(cap_sq);
+        if (crate::movegen::pawn::get_pawn_attacks(king_sq, side) & enemy_pawns) != 0 { return false; }
+        
+        // 4. King attacks
+        if (crate::movegen::king::get_king_attacks(king_sq) & self.kings[e_idx]) != 0 { return false; }
+        
+        true
     }
 
     // ===================================================================
@@ -389,11 +412,8 @@ impl Board {
         if (pinned & bit(from)) == 0 {
             return true;
         }
-
         let king_sq = self.kings[self.side_to_move.idx()].trailing_zeros() as u8;
-        let pin_line = self.between(king_sq, from) | bit(king_sq) | bit(from);
-
-        (pin_line & bit(to)) != 0
+        crate::magic::aligned(from, to, king_sq)
     }
 
     // ===================================================================
@@ -414,9 +434,10 @@ impl Board {
         let to = m.to();
         let pt = self.pieces[from as usize].unwrap();
 
-        // King moves are always legal if target is not attacked (already checked in basic move gen usually)
+        // King moves are always legal if target is not attacked (must exclude original square from occupancy)
         if pt == PieceType::King {
-            return !self.is_square_attacked(to, side.opposite());
+            let occ = self.all_occupancy ^ bit(from);
+            return !self.is_square_attacked_with_occ(to, side.opposite(), occ);
         }
 
         // Double check → only king moves are possible
@@ -620,20 +641,20 @@ impl Board {
     #[inline(always)]
     pub fn remove_piece(&mut self, sq: u8, pt: PieceType, color: Color) {
         let bb = bit(sq);
+        let mask = !bb;
         let c = color.idx();
         match pt {
-            PieceType::Pawn => self.pawns[c] ^= bb,
-            PieceType::Knight => self.knights[c] ^= bb,
-            PieceType::Bishop => self.bishops[c] ^= bb,
-            PieceType::Rook => self.rooks[c] ^= bb,
-            PieceType::Queen => self.queens[c] ^= bb,
-            PieceType::King => self.kings[c] ^= bb,
+            PieceType::Pawn => self.pawns[c] &= mask,
+            PieceType::Knight => self.knights[c] &= mask,
+            PieceType::Bishop => self.bishops[c] &= mask,
+            PieceType::Rook => self.rooks[c] &= mask,
+            PieceType::Queen => self.queens[c] &= mask,
+            PieceType::King => self.kings[c] &= mask,
         }
         self.pieces[sq as usize] = None;
         self.colors[sq as usize] = None;
         self.hash ^= ZOBRIST.hash_piece(color, pt, sq);
 
-        let mask = !bb;
         self.occupancy[c] &= mask;
         self.all_occupancy &= mask;
     }
@@ -937,7 +958,10 @@ impl Board {
     }
 
     pub fn is_square_attacked(&self, sq: u8, attacker_color: Color) -> bool {
-        let occ = self.all_occupancy;
+        self.is_square_attacked_with_occ(sq, attacker_color, self.all_occupancy)
+    }
+
+    pub fn is_square_attacked_with_occ(&self, sq: u8, attacker_color: Color, occ: u64) -> bool {
         let c = attacker_color.idx();
 
         // Pawns
@@ -1111,27 +1135,7 @@ impl Board {
     }
 
     pub fn between(&self, s1: u8, s2: u8) -> u64 {
-        // Simple implementation of squares between two squares on a line/diagonal
-        // In a real engine, this would be a precomputed table.
-        let mut b = 0u64;
-        let r1 = (s1 / 8) as i8;
-        let c1 = (s1 % 8) as i8;
-        let r2 = (s2 / 8) as i8;
-        let c2 = (s2 % 8) as i8;
-
-        let dr = (r2 - r1).signum();
-        let dc = (c2 - c1).signum();
-
-        if dr == 0 || dc == 0 || (r1 - r2).abs() == (c1 - c2).abs() {
-            let mut r = r1 + dr;
-            let mut c = c1 + dc;
-            while r != r2 || c != c2 {
-                b |= bit((r * 8 + c) as u8);
-                r += dr;
-                c += dc;
-            }
-        }
-        b
+        crate::magic::between_bb(s1, s2)
     }
 
     pub fn compute_hash(&self) -> u64 {

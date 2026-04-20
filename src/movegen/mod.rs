@@ -67,77 +67,14 @@ pub fn init_all() {
     }
 
 pub fn generate_legal_moves(board: &Board) -> MoveList {
-    let side = board.side_to_move;
-    let king_sq = board.kings[side.idx()].trailing_zeros() as u8;
-    let (pinned, checkers) = board.pins_and_checkers(side);
-    let num_checkers = count_bits(checkers);
-
     let mut legal_moves = MoveList::new();
     let pseudo_moves = generate_pseudo_legal_moves(board);
-    let mut temp_board = board.clone();
 
-    // If in double check, only king moves can be legal
-    if num_checkers > 1 {
-        for i in 0..pseudo_moves.len() {
-            let m = pseudo_moves.get(i);
-            if m.from() == king_sq {
-                let state = temp_board.make_move(m);
-                if !temp_board.is_in_check(side) {
-                    legal_moves.push(m);
-                }
-                temp_board.unmake_move(m, state);
-            }
-        }
-        return legal_moves;
-    }
-
-    // Single check or no check
     for i in 0..pseudo_moves.len() {
         let m = pseudo_moves.get(i);
-        let from = m.from();
-        let f = m.flags();
-
-        // 1. King moves: always need to check if destination is attacked
-        if from == king_sq {
-            let state = temp_board.make_move(m);
-            if !temp_board.is_in_check(side) {
-                legal_moves.push(m);
-            }
-            temp_board.unmake_move(m, state);
-            continue;
+        if board.is_legal(m) {
+            legal_moves.push(m);
         }
-
-        // 2. If in single check, non-king move must block or capture the checker
-        if num_checkers == 1 {
-            let checker_sq = checkers.trailing_zeros() as u8;
-            let target_mask = bit(checker_sq) | board.between(king_sq, checker_sq);
-            if (bit(m.to()) & target_mask) == 0 && f != flags::EN_PASSANT {
-                continue;
-            }
-        }
-
-        // 3. Pinned pieces can only move along the pin ray
-        if (bit(from) & pinned) != 0 {
-            let state = temp_board.make_move(m);
-            if !temp_board.is_in_check(side) {
-                legal_moves.push(m);
-            }
-            temp_board.unmake_move(m, state);
-            continue;
-        }
-
-        // 4. En passant is special because it removes TWO pieces from the rank
-        if f == flags::EN_PASSANT {
-            let state = temp_board.make_move(m);
-            if !temp_board.is_in_check(side) {
-                legal_moves.push(m);
-            }
-            temp_board.unmake_move(m, state);
-            continue;
-        }
-
-        // 5. All other moves are legal!
-        legal_moves.push(m);
     }
 
     legal_moves
@@ -275,5 +212,37 @@ mod tests {
         b.update_occupancy();
 
         assert_eq!(get_game_state(&b), GameState::Stalemate);
+    }
+
+    #[test]
+    fn test_en_passant_generation() {
+        init_all();
+        // FEN: rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2
+        let board = Board::from_fen("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2").unwrap();
+        let moves = generate_legal_moves(&board);
+        
+        let mut found_ep = false;
+        for m in moves {
+            if m.flags() == flags::EN_PASSANT {
+                found_ep = true;
+                // White e5 pawn captures on d6
+                assert_eq!(m.from(), 36); // e5 is square 36
+                assert_eq!(m.to(), 43); // d6 is square 43
+            }
+        }
+        assert!(found_ep, "En Passant move should be generated and legal");
+    }
+
+    #[test]
+    fn test_search_en_passant() {
+        init_all();
+        // FEN: rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2
+        let mut board = Board::from_fen("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2").unwrap();
+        let tt = std::sync::Arc::new(crate::engine::tt::TranspositionTable::new(1));
+        let mut searcher = crate::engine::search::Searcher::new(tt);
+        let result = searcher.search(&mut board, 5, None, None, 1);
+        
+        assert!(result.best_move.is_some(), "Search should return a move for en passant position");
+        // Often e5d6 is a very good move here or at least considered.
     }
 }

@@ -108,6 +108,8 @@ impl Uci {
             for &m_str in &args[current_idx + 1..] {
                 if let Some(m) = self.board.parse_move(m_str) {
                     self.board.make_move(m);
+                } else {
+                    eprintln!("FAILED TO PARSE MOVE: {}", m_str);
                 }
             }
         }
@@ -202,10 +204,11 @@ impl Uci {
             i += 1;
         }
 
-        let time_limit = if let Some(mt) = movetime {
-            Some(Duration::from_millis(mt.saturating_sub(20))) // subtract a small margin
+        let (soft_limit, hard_limit) = if let Some(mt) = movetime {
+            let limit = Duration::from_millis(mt.saturating_sub(20)); // subtract a small margin
+            (Some(limit), Some(limit))
         } else if infinite {
-            None
+            (None, None)
         } else {
             self.allocate_time(wtime, btime, winc, binc, movestogo)
         };
@@ -213,7 +216,7 @@ impl Uci {
         // If depth is not specified, use a large depth if we have time control or infinite
         let search_depth = if let Some(d) = depth {
             d
-        } else if time_limit.is_some() || infinite || nodes.is_some() {
+        } else if soft_limit.is_some() || infinite || nodes.is_some() {
             100 // Large depth for infinite or time control
         } else {
             6
@@ -237,7 +240,7 @@ impl Uci {
             thread_searcher.nodes = nodes_clone;
             thread_searcher.stop = stop_clone;
             
-            let result = thread_searcher.search(&mut board_clone, search_depth, time_limit, num_threads);
+            let result = thread_searcher.search(&mut board_clone, search_depth, soft_limit, hard_limit, num_threads);
             
             let mut best_move = result.best_move;
             let mut score = result.score;
@@ -282,7 +285,7 @@ impl Uci {
     }
 
 
-    fn allocate_time(&self, wtime: Option<u64>, btime: Option<u64>, winc: u64, binc: u64, movestogo: Option<u64>) -> Option<Duration> {
+    fn allocate_time(&self, wtime: Option<u64>, btime: Option<u64>, winc: u64, binc: u64, movestogo: Option<u64>) -> (Option<Duration>, Option<Duration>) {
         let (my_time, my_inc) = if self.board.side_to_move == crate::board::piece::Color::White {
             (wtime, winc)
         } else {
@@ -296,7 +299,6 @@ impl Uci {
             let mut allocated = time / moves_to_go + my_inc * 3 / 4;
             
             // Adjust based on game phase (complexity)
-            // Total pieces on board is a simple proxy for complexity
             let piece_count = self.board.all_occupancy.count_ones();
             if piece_count > 20 {
                 // More time in complex positions (middlegame)
@@ -306,9 +308,15 @@ impl Uci {
                 allocated = allocated * 8 / 10;
             }
 
-            // Never spend more than 80% of total time on one move
+            // Hard limit: up to 3x the soft limit to resolve critical instability
+            let mut hard_allocated = allocated * 3;
+
+            // Never spend more than 80% of total time on one move for soft, 90% for hard
             if allocated > time * 8 / 10 {
                 allocated = time * 8 / 10;
+            }
+            if hard_allocated > time * 9 / 10 {
+                hard_allocated = time * 9 / 10;
             }
 
             // Safety margin: subtract 50ms for communication overhead
@@ -318,10 +326,31 @@ impl Uci {
                 allocated = allocated.min(10); // at least 10ms if we are very low
             }
 
-            Some(Duration::from_millis(allocated))
+            if hard_allocated > 50 {
+                hard_allocated -= 50;
+            } else {
+                hard_allocated = hard_allocated.min(10);
+            }
+
+            (Some(Duration::from_millis(allocated)), Some(Duration::from_millis(hard_allocated)))
         } else {
-            None
+            (None, None)
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gui_position_string() {
+        crate::movegen::init_all();
+        let mut uci = Uci::new();
+        let cmd = "position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 moves e2e4 e7e5 g1f3 b8c6 d2d4 e5d4 f3d4 g8f6 d4c6 b7c6 b1c3 f8b4 e4e5 d8e7 d1e2 f6d5 c1d2 d5c3 b2c3 b4c3 d2c3";
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        uci.handle_position(&parts[1..]);
+        assert_eq!(uci.board.side_to_move, crate::board::piece::Color::Black);
+    }
 }

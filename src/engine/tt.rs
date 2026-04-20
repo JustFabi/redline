@@ -26,30 +26,18 @@ pub struct TranspositionTable {
 
 impl TranspositionTable {
     pub fn new(mb: usize) -> Self {
-        let count = (mb * 1024 * 1024 / 16).next_power_of_two();
-        let mut table = Vec::with_capacity(count * 2);
-        for _ in 0..count * 2 {
+        // 32 bytes per bucket (4 u64s)
+        let bucket_count = (mb * 1024 * 1024 / 32).max(1).next_power_of_two();
+        let mut table = Vec::with_capacity(bucket_count * 4);
+        for _ in 0..bucket_count * 4 {
             table.push(AtomicU64::new(0));
         }
-        Self { table, mask: count - 1 }
+        Self { table, mask: bucket_count - 1 }
     }
 
     pub fn store(&self, key: u64, depth: u8, score: i32, node_type: NodeType, best_move: Option<Move>, age: u8) {
-        let idx = (key as usize & self.mask) * 2;
+        let idx = (key as usize & self.mask) * 4;
         
-        let existing_data = self.table[idx + 1].load(Ordering::Relaxed);
-        let existing_depth = (existing_data & 0xFF) as u8;
-        let existing_age = ((existing_data >> 42) & 0x3F) as u8;
-        
-        // Age-preferred replacement: if age is different, we definitely want to replace if depth is reasonable.
-        // Usually: (new_age != existing_age) OR (new_depth >= existing_depth)
-        if age == existing_age && depth < existing_depth {
-            let stored_key = self.table[idx].load(Ordering::Relaxed);
-            if stored_key == key {
-                return;
-            }
-        }
-
         let mut data = 0u64;
         data |= (depth as u64) & 0xFF;
         data |= ((score as u64) & 0xFFFFFFFF) << 8;
@@ -64,41 +52,70 @@ impl TranspositionTable {
             data |= (m.raw() as u64) << 48;
         }
 
+        let key1 = self.table[idx].load(Ordering::Relaxed);
+        let key2 = self.table[idx + 2].load(Ordering::Relaxed);
+
+        // Always update if same key
+        if key1 == key {
+            self.table[idx + 1].store(data, Ordering::Relaxed);
+            self.table[idx].store(key, Ordering::Release);
+            return;
+        }
+        if key2 == key {
+            self.table[idx + 3].store(data, Ordering::Relaxed);
+            self.table[idx + 2].store(key, Ordering::Release);
+            return;
+        }
+
+        // Slot 1 is Always-Replace
         self.table[idx + 1].store(data, Ordering::Relaxed);
         self.table[idx].store(key, Ordering::Release);
+
+        // Slot 2 is Depth-Preferred
+        let existing_data2 = self.table[idx + 3].load(Ordering::Relaxed);
+        let existing_depth2 = (existing_data2 & 0xFF) as u8;
+        
+        if depth >= existing_depth2 {
+            self.table[idx + 3].store(data, Ordering::Relaxed);
+            self.table[idx + 2].store(key, Ordering::Release);
+        }
     }
 
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        let idx = (key as usize & self.mask) * 2;
+        let idx = (key as usize & self.mask) * 4;
         
-        let stored_key = self.table[idx].load(Ordering::Acquire);
-        if stored_key != key {
-            return None;
-        }
-        
-        let data = self.table[idx + 1].load(Ordering::Relaxed);
-        
-        let depth = (data & 0xFF) as u8;
-        let score = (data >> 8) as i32;
-        let type_val = (data >> 40) & 0x3;
-        let age = ((data >> 42) & 0x3F) as u8;
-        let node_type = match type_val {
-            0 => NodeType::Exact,
-            1 => NodeType::Alpha,
-            2 => NodeType::Beta,
-            _ => NodeType::Exact,
-        };
-        let move_raw = (data >> 48) as u16;
-        let best_move = if move_raw != 0 { Some(Move::from_raw(move_raw)) } else { None };
+        let mut found_data = None;
 
-        Some(TTEntry {
-            key,
-            depth,
-            score,
-            node_type,
-            best_move,
-            age,
-        })
+        if self.table[idx].load(Ordering::Acquire) == key {
+            found_data = Some(self.table[idx + 1].load(Ordering::Relaxed));
+        } else if self.table[idx + 2].load(Ordering::Acquire) == key {
+            found_data = Some(self.table[idx + 3].load(Ordering::Relaxed));
+        }
+
+        if let Some(data) = found_data {
+            let depth = (data & 0xFF) as u8;
+            let score = (data >> 8) as i32;
+            let type_val = (data >> 40) & 0x3;
+            let age = ((data >> 42) & 0x3F) as u8;
+            let node_type = match type_val {
+                0 => NodeType::Exact,
+                1 => NodeType::Alpha,
+                2 => NodeType::Beta,
+                _ => NodeType::Exact,
+            };
+            let move_raw = (data >> 48) as u16;
+            let best_move = if move_raw != 0 { Some(Move::from_raw(move_raw)) } else { None };
+
+            return Some(TTEntry {
+                key,
+                depth,
+                score,
+                node_type,
+                best_move,
+                age,
+            });
+        }
+        None
     }
 
     pub fn hashfull(&self) -> usize {
@@ -106,7 +123,8 @@ impl TranspositionTable {
         let sample_size = (self.mask + 1).min(1000);
         if sample_size == 0 { return 0; }
         for i in 0..sample_size {
-            if self.table[i * 2].load(Ordering::Relaxed) != 0 {
+            // Count bucket as occupied if either slot is used
+            if self.table[i * 4].load(Ordering::Relaxed) != 0 || self.table[i * 4 + 2].load(Ordering::Relaxed) != 0 {
                 occupied += 1;
             }
         }

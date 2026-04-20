@@ -11,6 +11,9 @@ static mut ROOK_SHIFTS: [u32; 64] = [0; 64];
 static mut BISHOP_ATTACKS: [[u64; 512]; 64] = [[0; 512]; 64];
 static mut ROOK_ATTACKS: [[u64; 4096]; 64] = [[0; 4096]; 64];
 
+pub static mut LINE_BB: [[u64; 64]; 64] = [[0; 64]; 64];
+pub static mut BETWEEN_BB: [[u64; 64]; 64] = [[0; 64]; 64];
+
 /// Fast lookup for Bishop attacks
 #[inline(always)]
 pub fn get_bishop_attacks(sq: u8, occ: u64) -> u64 {
@@ -41,6 +44,16 @@ pub fn get_queen_attacks(sq: u8, occ: u64) -> u64 {
     get_bishop_attacks(sq, occ) | get_rook_attacks(sq, occ)
 }
 
+#[inline(always)]
+pub fn aligned(s1: u8, s2: u8, s3: u8) -> bool {
+    unsafe { (LINE_BB[s1 as usize][s2 as usize] & bit(s3)) != 0 }
+}
+
+#[inline(always)]
+pub fn between_bb(s1: u8, s2: u8) -> u64 {
+    unsafe { BETWEEN_BB[s1 as usize][s2 as usize] }
+}
+
 /// Initialize Magic Bitboards. Call this exactly once at startup!
 pub fn init_magics() {
     for sq in 0..64 {
@@ -55,6 +68,9 @@ pub fn init_magics() {
             ROOK_MAGICS[sq] = find_magic(sq as u8, ROOK_MASKS[sq].count_ones(), false);
         }
     }
+    
+    // Initialize line and between boards
+    compute_line_and_between();
 }
 
 // ==========================================
@@ -126,6 +142,59 @@ fn slow_rook_attacks(sq: u8, occ: u64) -> u64 {
         }
     }
     attacks
+}
+
+fn compute_line_and_between() {
+    for s1 in 0..64 {
+        for s2 in 0..64 {
+            if s1 == s2 { continue; }
+            
+            let r1 = (s1 / 8) as i8;
+            let c1 = (s1 % 8) as i8;
+            let r2 = (s2 / 8) as i8;
+            let c2 = (s2 % 8) as i8;
+            
+            let dr = r2 - r1;
+            let dc = c2 - c1;
+            
+            if dr == 0 || dc == 0 || dr.abs() == dc.abs() {
+                // They are aligned
+                let step_r = dr.signum();
+                let step_c = dc.signum();
+                
+                // Full line
+                let mut line = 0u64;
+                let mut r = r1;
+                let mut c = c1;
+                // Go backwards to start of line
+                while r - step_r >= 0 && r - step_r < 8 && c - step_c >= 0 && c - step_c < 8 {
+                    r -= step_r;
+                    c -= step_c;
+                }
+                // Trace the whole line
+                while r >= 0 && r < 8 && c >= 0 && c < 8 {
+                    line |= bit((r * 8 + c) as u8);
+                    r += step_r;
+                    c += step_c;
+                }
+                
+                // Between
+                let mut between = 0u64;
+                r = r1 + step_r;
+                c = c1 + step_c;
+                while r != r2 || c != c2 {
+                    between |= bit((r * 8 + c) as u8);
+                    r += step_r;
+                    c += step_c;
+                }
+                
+                unsafe {
+                    LINE_BB[s1 as usize][s2 as usize] = line;
+                    BETWEEN_BB[s1 as usize][s2 as usize] = between;
+                }
+            }
+        }
+    }
 }
 
 /// Maps an index (e.g. 0 to 4095) to a specific board occupancy layout

@@ -44,26 +44,16 @@ fn generate_white_pawns(board: &Board, moves: &mut MoveList, captures_only: bool
     let rank8 = 0xFF00000000000000;
     let rank2 = 0x000000000000FF00;
 
+    let single_push = (pawns << 8) & empty;
+
     if !captures_only {
         // =========================
         // Single pushes (1 square forward)
         // =========================
-        let single_push = (pawns << 8) & empty;
-
         let mut bb = single_push & !rank8; // not promotion
         while bb != 0 {
             let to = pop_lsb(&mut bb);
             moves.push(Move::new(to - 8, to, flags::QUIET));
-        }
-
-        let mut bb = single_push & rank8; // promotions
-        while bb != 0 {
-            let to = pop_lsb(&mut bb);
-            let from = to - 8;
-            moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT));
-            moves.push(Move::new(from, to, flags::PROMOTE_BISHOP));
-            moves.push(Move::new(from, to, flags::PROMOTE_ROOK));
-            moves.push(Move::new(from, to, flags::PROMOTE_QUEEN));
         }
 
         // =========================
@@ -75,6 +65,18 @@ fn generate_white_pawns(board: &Board, moves: &mut MoveList, captures_only: bool
         while bb != 0 {
             let to = pop_lsb(&mut bb);
             moves.push(Move::new(to - 16, to, flags::DOUBLE_PAWN));
+        }
+    }
+
+    let mut bb = single_push & rank8; // promotions
+    while bb != 0 {
+        let to = pop_lsb(&mut bb);
+        let from = to - 8;
+        moves.push(Move::new(from, to, flags::PROMOTE_QUEEN));
+        if !captures_only {
+            moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT));
+            moves.push(Move::new(from, to, flags::PROMOTE_BISHOP));
+            moves.push(Move::new(from, to, flags::PROMOTE_ROOK));
         }
     }
 
@@ -148,26 +150,16 @@ fn generate_black_pawns(board: &Board, moves: &mut MoveList, captures_only: bool
     let rank1 = 0x00000000000000FF;
     let rank7 = 0x00FF000000000000;
 
+    let single_push = (pawns >> 8) & empty;
+
     if !captures_only {
         // =========================
         // Single pushes
         // =========================
-        let single_push = (pawns >> 8) & empty;
-
         let mut bb = single_push & !rank1;
         while bb != 0 {
             let to = pop_lsb(&mut bb);
             moves.push(Move::new(to + 8, to, flags::QUIET));
-        }
-
-        let mut bb = single_push & rank1;
-        while bb != 0 {
-            let to = pop_lsb(&mut bb);
-            let from = to + 8;
-            moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT));
-            moves.push(Move::new(from, to, flags::PROMOTE_BISHOP));
-            moves.push(Move::new(from, to, flags::PROMOTE_ROOK));
-            moves.push(Move::new(from, to, flags::PROMOTE_QUEEN));
         }
 
         // =========================
@@ -179,6 +171,18 @@ fn generate_black_pawns(board: &Board, moves: &mut MoveList, captures_only: bool
         while bb != 0 {
             let to = pop_lsb(&mut bb);
             moves.push(Move::new(to + 16, to, flags::DOUBLE_PAWN));
+        }
+    }
+
+    let mut bb = single_push & rank1;
+    while bb != 0 {
+        let to = pop_lsb(&mut bb);
+        let from = to + 8;
+        moves.push(Move::new(from, to, flags::PROMOTE_QUEEN));
+        if !captures_only {
+            moves.push(Move::new(from, to, flags::PROMOTE_KNIGHT));
+            moves.push(Move::new(from, to, flags::PROMOTE_BISHOP));
+            moves.push(Move::new(from, to, flags::PROMOTE_ROOK));
         }
     }
 
