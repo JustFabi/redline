@@ -4,6 +4,7 @@ use super::bitboard::*;
 use super::piece::{Color, PieceType};
 use super::r#move::{Move, flags};
 use super::zobrist::ZOBRIST;
+use super::pst::{MG_VALUE, EG_VALUE, MG_PST, EG_PST};
 use crate::movegen::knight::get_knight_attacks;
 use crate::movegen::king::get_king_attacks;
 use crate::movegen::sliding::{get_bishop_attacks, get_rook_attacks};
@@ -50,6 +51,12 @@ pub struct Board {
 
     // Zobrist hash
     pub hash: u64,
+
+    // Incremental evaluation scores (White - Black)
+    pub mg_pst: i32,
+    pub eg_pst: i32,
+
+    pub pawn_hash: u64,
 }
 
 pub mod castling {
@@ -67,6 +74,9 @@ pub struct UndoState {
     pub captured_piece: PieceType,
     pub last_move: Option<Move>,
     pub hash: u64,
+    pub mg_pst: i32,
+    pub eg_pst: i32,
+    pub pawn_hash: u64,
 }
 
 impl Board {
@@ -91,6 +101,9 @@ impl Board {
             pieces: [PieceType::Empty; 64],
             colors: [Color::None; 64],
             hash: 0,
+            mg_pst: 0,
+            eg_pst: 0,
+            pawn_hash: 0,
         };
 
         // =========================
@@ -164,6 +177,9 @@ impl Board {
             pieces: [PieceType::Empty; 64],
             colors: [Color::None; 64],
             hash: 0,
+            mg_pst: 0,
+            eg_pst: 0,
+            pawn_hash: 0,
         };
 
         let parts: Vec<&str> = fen.split_whitespace().collect();
@@ -241,6 +257,7 @@ impl Board {
         }
 
         board.update_occupancy();
+        board.hash = board.compute_hash();
         Some(board)
     }
 /// Returns whether a move is **pseudo-legal** and does **not** leave the king in check.
@@ -404,6 +421,84 @@ impl Board {
         if (crate::movegen::king::get_king_attacks(king_sq) & self.kings[e_idx]) != 0 { return false; }
         
         true
+    }
+
+    /// Optimized legality check that uses pre-calculated pin and checker masks.
+    #[inline(always)]
+    pub fn is_legal_fast(&self, m: Move, pinned: u64, checkers: u64) -> bool {
+        let from = m.from();
+        let to = m.to();
+        let flags = m.flags();
+        let moving_color = self.side_to_move;
+
+        // 1. Basic sanity (optional, but good for safety)
+        if self.colors[from as usize] != moving_color { return false; }
+        if self.colors[to as usize] == moving_color { return false; }
+
+        let pt = self.pieces[from as usize];
+
+        // 2. Special moves
+        match flags {
+            flags::KING_CASTLE | flags::QUEEN_CASTLE => {
+                return self.is_legal_castling(m);
+            }
+            flags::EN_PASSANT => {
+                return self.is_legal_en_passant(m);
+            }
+            _ => {}
+        }
+
+        // 3. Normal moves
+        if checkers == 0 {
+            if pt == PieceType::King {
+                let occ = self.all_occupancy ^ bit(from);
+                return !self.is_square_attacked_with_occ(to, moving_color.opposite(), occ);
+            }
+            if (pinned & bit(from)) == 0 {
+                return true;
+            }
+            return self.is_pinned_move_legal(from, to, pinned);
+        }
+
+        // 4. In check
+        self.is_legal_when_in_check_fast(m, pinned, checkers)
+    }
+
+    #[inline(never)]
+    fn is_legal_when_in_check_fast(&self, m: Move, _pinned: u64, checkers: u64) -> bool {
+        let side = self.side_to_move;
+        let num_checkers = count_bits(checkers);
+
+        let from = m.from();
+        let to = m.to();
+        let pt = self.pieces[from as usize];
+
+        if pt == PieceType::King {
+            let occ = self.all_occupancy ^ bit(from);
+            return !self.is_square_attacked_with_occ(to, side.opposite(), occ);
+        }
+
+        if num_checkers > 1 { return false; }
+
+        let checker_sq = checkers.trailing_zeros() as u8;
+        if to == checker_sq {
+            // Must not be pinned! (If we are pinned, we can't capture the checker unless it's on the pin ray)
+            // But wait, the standard is_legal handles pinned already?
+            // Actually, if we are in check, a pinned piece can only capture the checker if the checker is on the pin ray.
+            // Since is_pinned_move_legal handles that, we should use it.
+            return self.is_pinned_move_legal(from, to, _pinned);
+        }
+
+        let checker_pt = self.pieces[checker_sq as usize];
+        if checker_pt == PieceType::Knight || checker_pt == PieceType::Pawn {
+            return false;
+        }
+
+        let block_mask = self.between(checker_sq, self.kings[side.idx()].trailing_zeros() as u8);
+        if (block_mask & bit(to)) != 0 {
+             return self.is_pinned_move_legal(from, to, _pinned);
+        }
+        false
     }
 
     // ===================================================================
@@ -663,6 +758,23 @@ impl Board {
         self.colors[sq as usize] = Color::None;
         self.hash ^= ZOBRIST.hash_piece(color, pt, sq);
 
+        let p_idx = pt.idx();
+        let pst_sq = if color == Color::White { ((7 - (sq / 8)) * 8 + (sq % 8)) as usize } else { sq as usize };
+        let mg = MG_VALUE[p_idx] + MG_PST[p_idx][pst_sq];
+        let eg = EG_VALUE[p_idx] + EG_PST[p_idx][pst_sq];
+
+        if color == Color::White {
+            self.mg_pst -= mg;
+            self.eg_pst -= eg;
+        } else {
+            self.mg_pst += mg;
+            self.eg_pst += eg;
+        }
+
+        if pt == PieceType::Pawn {
+            self.pawn_hash ^= ZOBRIST.hash_piece(color, pt, sq);
+        }
+
         self.occupancy[c] &= mask;
         self.all_occupancy &= mask;
     }
@@ -684,6 +796,23 @@ impl Board {
         self.colors[sq as usize] = color;
         self.hash ^= ZOBRIST.hash_piece(color, pt, sq);
 
+        let p_idx = pt.idx();
+        let pst_sq = if color == Color::White { ((7 - (sq / 8)) * 8 + (sq % 8)) as usize } else { sq as usize };
+        let mg = MG_VALUE[p_idx] + MG_PST[p_idx][pst_sq];
+        let eg = EG_VALUE[p_idx] + EG_PST[p_idx][pst_sq];
+
+        if color == Color::White {
+            self.mg_pst += mg;
+            self.eg_pst += eg;
+        } else {
+            self.mg_pst -= mg;
+            self.eg_pst -= eg;
+        }
+
+        if pt == PieceType::Pawn {
+            self.pawn_hash ^= ZOBRIST.hash_piece(color, pt, sq);
+        }
+
         self.occupancy[c] |= bb;
         self.all_occupancy |= bb;
     }
@@ -703,6 +832,9 @@ impl Board {
                captured_piece: self.pieces[to as usize],
                last_move: self.last_move,
                hash: self.hash,
+               mg_pst: self.mg_pst,
+               eg_pst: self.eg_pst,
+               pawn_hash: self.pawn_hash,
            };
 
            self.last_move = Some(m);
@@ -801,6 +933,9 @@ impl Board {
         self.en_passant_square = state.en_passant_square;
         self.halfmove_clock = state.halfmove_clock;
         self.hash = state.hash;
+        self.mg_pst = state.mg_pst;
+        self.eg_pst = state.eg_pst;
+        self.pawn_hash = state.pawn_hash;
         if self.side_to_move == Color::White {
             self.fullmove_number -= 1;
         }
@@ -860,6 +995,9 @@ impl Board {
             captured_piece: PieceType::Empty,
             last_move: self.last_move,
             hash: self.hash,
+            mg_pst: self.mg_pst,
+            eg_pst: self.eg_pst,
+            pawn_hash: self.pawn_hash,
         };
 
         self.last_move = None;
@@ -881,6 +1019,8 @@ impl Board {
         self.en_passant_square = state.en_passant_square;
         self.halfmove_clock = state.halfmove_clock;
         self.hash = state.hash;
+        self.mg_pst = state.mg_pst;
+        self.eg_pst = state.eg_pst;
         if self.side_to_move == Color::White {
             self.fullmove_number -= 1;
         }
@@ -904,7 +1044,8 @@ impl Board {
         }
         self.pieces[sq as usize] = PieceType::Empty;
         self.colors[sq as usize] = Color::None;
-
+        // PST, hash, and pawn_hash are restored from UndoState in unmake_move;
+        // do NOT update them here.
         self.occupancy[c] &= mask;
         self.all_occupancy &= mask;
     }
@@ -923,7 +1064,8 @@ impl Board {
         }
         self.pieces[sq as usize] = pt;
         self.colors[sq as usize] = color;
-
+        // PST, hash, and pawn_hash are restored from UndoState in unmake_move;
+        // do NOT update them here.
         self.occupancy[c] |= bb;
         self.all_occupancy |= bb;
     }

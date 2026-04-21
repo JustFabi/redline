@@ -25,6 +25,7 @@ fn main() {
     init_knight_attacks();
     init_king_attacks();
     magic::init_magics();
+    engine::eval::init_eval();
 
     let args: Vec<String> = std::env::args().collect();
 

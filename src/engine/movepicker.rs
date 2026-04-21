@@ -1,6 +1,6 @@
 use crate::board::board::Board;
-use crate::board::r#move::{Move, flags};
-use crate::movegen::{self, GenType};
+use crate::board::r#move::Move;
+use crate::movegen;
 use crate::movegen::move_list::MoveList;
 use crate::engine::search::Searcher;
 
@@ -24,10 +24,11 @@ pub struct MovePicker {
     index: usize,
     killers: [Option<Move>; 2],
     is_qsearch: bool,
+    excluded_move: Option<Move>,
+    in_check: bool,
 }
-
 impl MovePicker {
-    pub fn new(tt_move: Option<Move>, killers: [Option<Move>; 2], is_qsearch: bool) -> Self {
+    pub fn new(tt_move: Option<Move>, killers: [Option<Move>; 2], is_qsearch: bool, in_check: bool) -> Self {
         Self {
             stage: Stage::TT,
             tt_move,
@@ -37,6 +38,23 @@ impl MovePicker {
             index: 0,
             killers,
             is_qsearch,
+            excluded_move: None,
+            in_check,
+        }
+    }
+
+    pub fn with_excluded(tt_move: Option<Move>, killers: [Option<Move>; 2], excluded: Option<Move>, in_check: bool) -> Self {
+        Self {
+            stage: Stage::TT,
+            tt_move,
+            moves: MoveList::new(),
+            scores: Vec::new(),
+            bad_captures: MoveList::new(),
+            index: 0,
+            killers,
+            is_qsearch: false,
+            excluded_move: excluded,
+            in_check,
         }
     }
 
@@ -46,12 +64,12 @@ impl MovePicker {
                 Stage::TT => {
                     self.stage = Stage::GenerateCaptures;
                     if let Some(m) = self.tt_move {
-                        // Assuming TT move is pseudo-legal
+                        if Some(m) == self.excluded_move { continue; }
                         return Some(m);
                     }
                 }
                 Stage::GenerateCaptures => {
-                    self.moves = if board.is_in_check(board.side_to_move) {
+                    self.moves = if self.in_check {
                         movegen::generate_evasions(board) // If in check, generate all evasions
                     } else {
                         movegen::generate_captures(board)
@@ -60,7 +78,6 @@ impl MovePicker {
                     self.scores.clear();
                     for i in 0..self.moves.len() {
                         let m = self.moves.get(i);
-                        // Score captures using MVV-LVA / SEE
                         let score = searcher.score_move(m, board, self.tt_move, ply, self.is_qsearch);
                         self.scores.push(score);
                     }
@@ -71,22 +88,24 @@ impl MovePicker {
                     while self.index < self.moves.len() {
                         searcher.pick_move(self.moves.as_mut_slice(), &mut self.scores, self.index);
                         let m = self.moves.get(self.index);
+                        let score = self.scores[self.index];
                         self.index += 1;
-                        if Some(m) == self.tt_move { continue; }
+                        if Some(m) == self.tt_move || Some(m) == self.excluded_move { continue; }
 
-                        if board.is_in_check(board.side_to_move) {
+                        if self.in_check {
                             return Some(m); // Evasions are just yielded in order
                         }
 
-                        let see = board.see(m);
-                        if see >= 0 {
+                        // Use the score assigned by score_move to partition good/bad captures.
+                        // score_move returns negative values for SEE-negative captures.
+                        if score >= 0 {
                             return Some(m);
                         } else {
                             self.bad_captures.push(m);
                         }
                     }
                     
-                    if board.is_in_check(board.side_to_move) || self.is_qsearch {
+                    if self.in_check || self.is_qsearch {
                         return None; // Done if qsearch or evasions
                     }
                     
@@ -115,7 +134,7 @@ impl MovePicker {
                         searcher.pick_move(self.moves.as_mut_slice(), &mut self.scores, self.index);
                         let m = self.moves.get(self.index);
                         self.index += 1;
-                        if Some(m) == self.tt_move { continue; }
+                        if Some(m) == self.tt_move || Some(m) == self.excluded_move { continue; }
                         return Some(m);
                     }
                     self.stage = Stage::BadCaptures;
@@ -125,6 +144,7 @@ impl MovePicker {
                     if self.index < self.bad_captures.len() {
                         let m = self.bad_captures.get(self.index);
                         self.index += 1;
+                        if Some(m) == self.excluded_move { continue; }
                         return Some(m);
                     }
                     return None;

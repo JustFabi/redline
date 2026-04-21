@@ -94,7 +94,7 @@ impl TranspositionTable {
 
         if let Some(data) = found_data {
             let depth = (data & 0xFF) as u8;
-            let score = (data >> 8) as i32;
+            let score = ((data >> 8) & 0xFFFFFFFF) as u32 as i32;
             let type_val = (data >> 40) & 0x3;
             let age = ((data >> 42) & 0x3F) as u8;
             let node_type = match type_val {

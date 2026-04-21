@@ -2,7 +2,7 @@ use crate::board::board::Board;
 use crate::board::r#move::{Move, flags};
 use crate::board::piece::PieceType;
 use crate::movegen;
-use crate::engine::eval::evaluate;
+use crate::engine::eval::{evaluate, PawnTable};
 use crate::engine::tt::{TranspositionTable, NodeType};
 use std::time::{Instant, Duration};
 use std::sync::Arc;
@@ -50,6 +50,7 @@ pub struct Searcher {
     pub age: u8,
     pub eval_history: [i32; MAX_PLY],
     pub pv: Vec<Move>,
+    pub pawn_table: PawnTable,
     lmr_table: [[u32; 64]; 64],
 }
 
@@ -70,6 +71,7 @@ impl Searcher {
                 age: 0,
                 eval_history: [0; MAX_PLY],
                 pv: Vec::new(),
+                pawn_table: PawnTable::new(8192),
                 lmr_table: build_lmr_table(),
             }
         }
@@ -150,14 +152,14 @@ impl Searcher {
             }
 
             loop {
-                let (_, score) = self.negamax(board, d, alpha, beta, 0);
+                let (_, score) = self.negamax(board, d, alpha, beta, 0, None);
 
                 if self.stop.load(Ordering::Relaxed) {
                     break;
                 }
 
                 if score <= alpha {
-                    // Fail low — widen alpha, report lowerbound
+                    // Fail low — widen alpha, report upperbound
                     if self.is_main_thread {
                         let elapsed = self.start_time.elapsed().as_millis() as u64;
                         let total_nodes = self.nodes.load(Ordering::Relaxed);
@@ -170,7 +172,7 @@ impl Searcher {
                     alpha = (alpha - delta).max(-INFINITY);
                     delta = (delta * 2).min(10_000);
                 } else if score >= beta {
-                    // Fail high — widen beta, report upperbound
+                    // Fail high — widen beta, report lowerbound
                     if self.is_main_thread {
                         let elapsed = self.start_time.elapsed().as_millis() as u64;
                         let total_nodes = self.nodes.load(Ordering::Relaxed);
@@ -263,6 +265,7 @@ impl Searcher {
         mut alpha: i32,
         mut beta: i32,
         ply: u32,
+        excluded_move: Option<Move>,
     ) -> (Option<Move>, i32) {
 
         let is_pv_node = beta - alpha > 1;
@@ -276,7 +279,7 @@ impl Searcher {
         }
 
         if ply >= MAX_PLY as u32 - 1 {
-            return (None, evaluate(board));
+            return (None, evaluate(board, Some(&mut self.pawn_table)));
         }
 
         if board.is_repetition() || board.halfmove_clock >= 100 {
@@ -292,7 +295,8 @@ impl Searcher {
 
         self.seldepth = self.seldepth.max(ply);
 
-        let in_check = board.is_in_check(board.side_to_move);
+        let (pinned, checkers) = board.pins_and_checkers(board.side_to_move);
+        let in_check = checkers != 0;
         if in_check && ply < 16 { depth += 1; }
 
         // TT Probe
@@ -305,7 +309,7 @@ impl Searcher {
             if tt_score > MATE_VALUE - 1000 { tt_score -= ply as i32; }
             else if tt_score < -MATE_VALUE + 1000 { tt_score += ply as i32; }
 
-            if ply > 0 && entry.depth >= depth as u8 {
+            if !is_pv_node && ply > 0 && entry.depth >= depth as u8 {
                 match entry.node_type {
                     NodeType::Exact => return (tt_move, tt_score),
                     NodeType::Alpha if tt_score <= alpha => return (tt_move, tt_score),
@@ -318,7 +322,7 @@ impl Searcher {
         // IID
         if is_pv_node && tt_move.is_none() && depth >= 4 {
             let d = depth - 2;
-            self.negamax(board, d, alpha, beta, ply);
+            self.negamax(board, d, alpha, beta, ply, None);
             if let Some(entry) = self.tt.probe(board.hash) {
                 tt_move = entry.best_move;
             }
@@ -328,7 +332,7 @@ impl Searcher {
             return (None, self.quiescence(board, alpha, beta, ply));
         }
 
-        let static_eval = evaluate(board);
+        let static_eval = evaluate(board, Some(&mut self.pawn_table));
         self.eval_history[ply as usize] = static_eval;
         let improving = ply >= 2 && static_eval > self.eval_history[ply as usize - 2];
 
@@ -349,13 +353,34 @@ impl Searcher {
                 let r = 3 + depth / 6 + eval_margin.clamp(0, 3) as u32;
 
                 let state = board.make_null_move();
-                let (_, mut score) = self.negamax(board, depth.saturating_sub(r + 1), -beta, -beta + 1, ply + 1);
+                let (_, mut score) = self.negamax(board, depth.saturating_sub(r + 1), -beta, -beta + 1, ply + 1, None);
                 score = -score;
                 board.unmake_null_move(state);
 
                 if score >= beta { 
                     let nmp_score = if score > MATE_VALUE - 1000 { beta } else { score };
                     return (None, nmp_score); 
+                }
+            }
+        }
+
+        // Singular Extension
+        let mut extension = 0;
+        if depth >= 8 && tt_move.is_some() && excluded_move.is_none() {
+            if let Some(ref entry) = tt_entry {
+                if entry.depth >= depth as u8 - 3 && entry.node_type != NodeType::Alpha {
+                    let tt_score = if entry.score > MATE_VALUE - 1000 { entry.score - ply as i32 }
+                                   else if entry.score < -MATE_VALUE + 1000 { entry.score + ply as i32 }
+                                   else { entry.score };
+                    
+                    let margin = 2 * depth as i32;
+                    let singular_beta = tt_score - margin;
+                    let singular_depth = (depth - 1) / 2;
+
+                    let (_, s_score) = self.negamax(board, singular_depth, singular_beta - 1, singular_beta, ply, tt_move);
+                    if s_score < singular_beta {
+                        extension = 1;
+                    }
                 }
             }
         }
@@ -369,11 +394,49 @@ impl Searcher {
 
         let mut is_first_move = true;
         let killers = if ply < MAX_PLY as u32 { self.killer_moves[ply as usize] } else { [None, None] };
-        let mut picker = MovePicker::new(tt_move, killers, false);
+        let mut picker = if let Some(excluded) = excluded_move {
+            MovePicker::with_excluded(tt_move, killers, Some(excluded), in_check)
+        } else {
+            MovePicker::new(tt_move, killers, false, in_check)
+        };
 
         while let Some(m) = picker.next(self, board, ply) {
-            if !board.is_legal(m) {
+            if !board.is_legal_fast(m, pinned, checkers) {
                 continue;
+            }
+
+            let is_quiet = (m.flags() & flags::CAPTURE) == 0;
+            let is_capture = (m.flags() & flags::CAPTURE) != 0;
+            let is_promotion = (m.flags() & 0x8) != 0;
+
+            // SEE pruning (must be before make_move — SEE inspects the pre-move board)
+            if !is_pv_node && is_capture && depth <= 8 && legal_moves > 0 {
+                let see = board.see(m);
+                if see < -50 * (depth as i32) * (depth as i32) {
+                    continue;
+                }
+            }
+
+            // LMP
+            if !is_pv_node && !in_check && depth <= 4 && is_quiet &&
+                legal_moves >= (3 + 3 * depth as usize * depth as usize / 2) {
+                continue;
+            }
+
+            // Futility
+            if !is_pv_node && depth <= 6 && !in_check && is_quiet && !is_promotion && legal_moves > 0 {
+                let margin = 120 * depth as i32 + 50;
+                if static_eval + margin <= alpha {
+                    continue;
+                }
+            }
+
+            // History Pruning: skip quiet moves with terrible history at shallow depths
+            if !is_pv_node && !in_check && is_quiet && depth <= 3 && legal_moves > 0 {
+                let hist = self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
+                if hist < -(depth as i32 * depth as i32 * 100) {
+                    continue;
+                }
             }
 
             if ply == 0 && self.is_main_thread {
@@ -387,44 +450,6 @@ impl Searcher {
 
             legal_moves += 1;
 
-            let is_quiet = (m.flags() & flags::CAPTURE) == 0;
-            let is_capture = (m.flags() & flags::CAPTURE) != 0;
-            let is_promotion = (m.flags() & 0x8) != 0;
-
-            // SEE pruning
-            if !is_pv_node && is_capture && depth <= 8 {
-                let see = board.see(m);
-                if see < -50 * (depth as i32) * (depth as i32) {
-                    board.unmake_move(m, state);
-                    continue;
-                }
-            }
-
-            // LMP
-            if !is_pv_node && !in_check && depth <= 4 && is_quiet &&
-                legal_moves >= (3 + 3 * depth as usize * depth as usize / 2) {
-                board.unmake_move(m, state);
-                continue;
-            }
-
-            // Futility
-            if !is_pv_node && depth <= 6 && !in_check && is_quiet && !is_promotion && legal_moves > 1 {
-                let margin = 120 * depth as i32 + 50;
-                if static_eval + margin <= alpha {
-                    board.unmake_move(m, state);
-                    continue;
-                }
-            }
-
-            // History Pruning: skip quiet moves with terrible history at shallow depths
-            if !is_pv_node && !in_check && is_quiet && depth <= 3 && legal_moves > 1 {
-                let hist = self.history[board.side_to_move.opposite().idx()][m.from() as usize][m.to() as usize];
-                if hist < -(depth as i32 * depth as i32 * 100) {
-                    board.unmake_move(m, state);
-                    continue;
-                }
-            }
-
             let mut score;
 
             let is_pv_move = is_pv_node && is_first_move;
@@ -433,36 +458,32 @@ impl Searcher {
             if !is_pv_move && depth >= 3 && legal_moves > 1 && is_quiet && !is_promotion && Some(m) != tt_move {
                 let mut reduction = self.lmr_table[depth.min(63) as usize][legal_moves.min(63) as usize];
 
-                if depth <= 3 {
-                    reduction = 0;
-                } else {
-                    reduction = reduction.min(depth - 2);
-                }
+                reduction = reduction.min(depth - 2);
 
                 if !improving { reduction += 1; }
 
                 let d = depth.saturating_sub(reduction + 1);
 
-                (_, score) = self.negamax(board, d, -alpha - 1, -alpha, ply + 1);
+                (_, score) = self.negamax(board, d, -alpha - 1, -alpha, ply + 1, None);
                 score = -score;
 
                 if score > alpha && reduction > 0 {
-                    (_, score) = self.negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1);
+                    (_, score) = self.negamax(board, depth - 1 + extension, -alpha - 1, -alpha, ply + 1, None);
                     score = -score;
                 }
 
             } else {
                 if is_first_move {
-                    (_, score) = self.negamax(board, depth - 1, -beta, -alpha, ply + 1);
+                    (_, score) = self.negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1, None);
                 } else {
-                    (_, score) = self.negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1);
+                    (_, score) = self.negamax(board, depth - 1 + extension, -alpha - 1, -alpha, ply + 1, None);
                 }
                 score = -score;
             }
 
             // PV re-search
             if !is_first_move && is_pv_node && score > alpha && score < beta {
-                (_, score) = self.negamax(board, depth - 1, -beta, -alpha, ply + 1);
+                (_, score) = self.negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1, None);
                 score = -score;
             }
 
@@ -508,10 +529,12 @@ impl Searcher {
     }
 
     fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u32) -> i32 {
-            if (self.nodes.fetch_add(1, Ordering::Relaxed) & 2047) == 0 { self.check_time(); }
-            
+            // Node counting is done in negamax; avoid double-counting here.
+            // Only check time periodically.
+            if (self.nodes.load(Ordering::Relaxed) & 2047) == 0 { self.check_time(); }
+
             if ply >= MAX_PLY as u32 - 1 {
-                return evaluate(board);
+                return evaluate(board, Some(&mut self.pawn_table));
             }
             
             if board.is_repetition() || board.halfmove_clock >= 100 {
@@ -520,18 +543,23 @@ impl Searcher {
 
             self.seldepth = self.seldepth.max(ply);
 
-            let in_check = board.is_in_check(board.side_to_move);
-            let stand_pat = if in_check { -INFINITY } else { evaluate(board) };
+            let (pinned, checkers) = board.pins_and_checkers(board.side_to_move);
+            let in_check = checkers != 0;
+            let stand_pat = if in_check { -INFINITY } else { evaluate(board, Some(&mut self.pawn_table)) };
 
-            if stand_pat >= beta { return beta; }
+            let mut best_score = stand_pat;
 
-            // Delta Pruning: if even the biggest possible gain can't reach alpha, bail
-            let big_delta = SEE_PIECE_VALUES[4] + DELTA_MARGIN; // Queen value + margin
-            if !in_check && stand_pat + big_delta < alpha {
-                return alpha;
+            if !in_check {
+                if stand_pat >= beta { return stand_pat; }
+
+                // Delta Pruning: if even the biggest possible gain can't reach alpha, bail
+                let big_delta = SEE_PIECE_VALUES[4] + DELTA_MARGIN; // Queen value + margin
+                if stand_pat + big_delta < alpha {
+                    return stand_pat;
+                }
+
+                if stand_pat > alpha { alpha = stand_pat; }
             }
-
-            if stand_pat > alpha { alpha = stand_pat; }
 
             let tt_entry = self.tt.probe(board.hash);
             let mut tt_move = None;
@@ -553,10 +581,10 @@ impl Searcher {
             
             let mut legal_moves = 0;
             let killers = [None, None];
-            let mut picker = MovePicker::new(tt_move, killers, true);
+            let mut picker = MovePicker::new(tt_move, killers, true, in_check);
 
             while let Some(m) = picker.next(self, board, ply) {
-                if !board.is_legal(m) { continue; }
+                if !board.is_legal_fast(m, pinned, checkers) { continue; }
 
                 // Delta Pruning per-move: skip captures that can't raise alpha
                 if !in_check {
@@ -567,18 +595,25 @@ impl Searcher {
                     }
                 }
 
+                self.nodes.fetch_add(1, Ordering::Relaxed);
+
                 let state = board.make_move(m);
                 legal_moves += 1;
 
                 let score = -self.quiescence(board, -beta, -alpha, ply + 1);
                 board.unmake_move(m, state);
 
-                if score >= beta { return beta; }
-                if score > alpha { alpha = score; }
+                if score > best_score {
+                    best_score = score;
+                    if score > alpha {
+                        alpha = score;
+                        if score >= beta { return score; }
+                    }
+                }
             }
 
             if in_check && legal_moves == 0 { return -MATE_VALUE + ply as i32; }
-            alpha
+            best_score
         }
 
     pub fn pick_move(&self, moves: &mut [Move], scores: &mut [i32], start: usize) {
@@ -592,21 +627,6 @@ impl Searcher {
         }
         moves.swap(start, best_idx);
         scores.swap(start, best_idx);
-    }
-
-    fn score_moves(
-        &self,
-        moves: &[Move],
-        board: &Board,
-        tt_move: Option<Move>,
-        ply: u32,
-        is_qsearch: bool,
-    ) -> Vec<i32> {
-        let mut scores = Vec::with_capacity(moves.len());
-        for &m in moves {
-            scores.push(self.score_move(m, board, tt_move, ply, is_qsearch));
-        }
-        scores
     }
 
     pub fn score_move(&self, m: Move, board: &Board, tt_move: Option<Move>, ply: u32, is_qsearch: bool) -> i32 {
@@ -795,6 +815,9 @@ mod tests {
             pieces: [PieceType::Empty; 64],
             colors: [Color::None; 64],
             hash: 0,
+            mg_pst: 0,
+            eg_pst: 0,
+            pawn_hash: 0,
         };
         board.put_piece(7, crate::board::piece::PieceType::King, crate::board::piece::Color::White);
         board.put_piece(48, crate::board::piece::PieceType::Rook, crate::board::piece::Color::White);
@@ -881,7 +904,8 @@ mod tests {
         let tt = Arc::new(TranspositionTable::new(1));
         let mut searcher = Searcher::new(tt);
         let result = searcher.search(&mut board, 1, None, None, 1);
-        // It's balanced, but eval might not be exactly 0 due to some weights
-        assert!(result.score.abs() < 500);
+        // Position is roughly balanced but engine may find tactical threats in qsearch
+        // (e.g. Ng5 attacking f7). Score should still be reasonable.
+        assert!(result.score.abs() < 700);
     }
 }

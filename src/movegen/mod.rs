@@ -219,6 +219,9 @@ mod tests {
             pieces: [PieceType::Empty; 64],
             colors: [Color::None; 64],
             hash: 0,
+            mg_pst: 0,
+            eg_pst: 0,
+            pawn_hash: 0,
         };
         // White: Kh1, Qc7
         // Black: Ka8
