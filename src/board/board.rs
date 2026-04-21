@@ -587,6 +587,7 @@ impl Board {
         self.all_occupancy = self.occupancy[w] | self.occupancy[b];
     }
 
+    #[allow(dead_code)]
     pub fn to_fen(&self) -> String {
         let mut fen = String::new();
 
@@ -667,6 +668,7 @@ impl Board {
         fen
     }
 
+    #[allow(dead_code)]
     pub fn print_board(&self) {
         println!("  +-----------------+");
         for row in (0..8).rev() {
@@ -1101,6 +1103,7 @@ impl Board {
 
     /// Returns total number of pieces on board
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn piece_count(&self) -> u32 {
         count_bits(self.all_occupancy)
     }

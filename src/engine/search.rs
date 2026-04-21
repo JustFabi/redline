@@ -31,8 +31,6 @@ pub struct SearchResult {
     pub best_move: Option<Move>,
     pub score: i32,
     pub depth: u32,
-    pub info_lines: Vec<String>,
-    pub pv: Vec<Move>,
 }
 
 pub struct Searcher {
@@ -253,8 +251,6 @@ impl Searcher {
             best_move,
             score: best_score,
             depth: last_completed_depth,
-            info_lines,
-            pv: self.pv.clone(),
         }
     }
 
@@ -393,11 +389,10 @@ impl Searcher {
         let old_alpha = alpha;
 
         let mut is_first_move = true;
-        let killers = if ply < MAX_PLY as u32 { self.killer_moves[ply as usize] } else { [None, None] };
         let mut picker = if let Some(excluded) = excluded_move {
-            MovePicker::with_excluded(tt_move, killers, Some(excluded), in_check)
+            MovePicker::with_excluded(tt_move, Some(excluded), in_check)
         } else {
-            MovePicker::new(tt_move, killers, false, in_check)
+            MovePicker::new(tt_move, false, in_check)
         };
 
         while let Some(m) = picker.next(self, board, ply) {
@@ -580,8 +575,7 @@ impl Searcher {
             use crate::engine::movepicker::MovePicker;
             
             let mut legal_moves = 0;
-            let killers = [None, None];
-            let mut picker = MovePicker::new(tt_move, killers, true, in_check);
+            let mut picker = MovePicker::new(tt_move, true, in_check);
 
             while let Some(m) = picker.next(self, board, ply) {
                 if !board.is_legal_fast(m, pinned, checkers) { continue; }
@@ -832,7 +826,6 @@ mod tests {
 
         assert!(result.best_move.is_some());
         assert_eq!(result.depth, 3);
-        assert!(!result.info_lines.is_empty());
         assert!(result.score >= MATE_VALUE - 100);
     }
 

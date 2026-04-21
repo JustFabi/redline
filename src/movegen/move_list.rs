@@ -24,6 +24,7 @@ impl MoveList {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn swap(&mut self, i: usize, j: usize) {
         self.moves.swap(i, j);
     }
@@ -34,6 +35,7 @@ impl MoveList {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }

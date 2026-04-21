@@ -9,6 +9,7 @@ use crate::board::r#move::flags;
 use crate::movegen::move_list::MoveList;
 use crate::board::bitboard::{bit, count_bits};
 
+#[allow(dead_code)]
 pub fn init_all() {
     knight::init_knight_attacks();
     king::init_king_attacks();
@@ -96,6 +97,7 @@ pub fn generate_legal_moves(board: &Board) -> MoveList {
     legal_moves
 }
 
+#[allow(dead_code)]
 pub fn is_check(board: &Board) -> bool {
     let side = board.side_to_move;
     let king_bb = board.kings[side.idx()];
@@ -104,6 +106,7 @@ pub fn is_check(board: &Board) -> bool {
     board.is_square_attacked(king_sq, side.opposite())
 }
 
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum GameState {
     Ongoing,
@@ -113,6 +116,7 @@ pub enum GameState {
     DrawFiftyMoveRule,
 }
 
+#[allow(dead_code)]
 pub fn get_game_state(board: &Board) -> GameState {
     let moves = generate_legal_moves(board);
     if moves.is_empty() {
@@ -134,6 +138,7 @@ pub fn get_game_state(board: &Board) -> GameState {
     GameState::Ongoing
 }
 
+#[allow(dead_code)]
 fn is_insufficient_material(board: &Board) -> bool {
     let total_pieces = board.piece_count();
     if total_pieces > 4 { return false; } // Too many pieces for simple draw
@@ -160,15 +165,15 @@ mod tests {
     use crate::board::piece::{Color, PieceType};
     use crate::board::r#move::{Move, flags};
 
-    fn perft(board: &Board, depth: u32) -> u64 {
+    fn perft(board: &mut Board, depth: u32) -> u64 {
         if depth == 0 { return 1; }
         let mut nodes = 0;
 
         let moves = generate_legal_moves(board);
         for m in moves {
-            let mut temp = board.clone();
-            temp.make_move(m);
-            nodes += perft(&temp, depth - 1);
+            let state = board.make_move(m);
+            nodes += perft(board, depth - 1);
+            board.unmake_move(m, state);
         }
         nodes
     }
@@ -176,10 +181,13 @@ mod tests {
     #[test]
     fn test_perft_startpos() {
         init_all();
-        let b = Board::startpos();
-        assert_eq!(perft(&b, 1), 20);
-        assert_eq!(perft(&b, 2), 400);
-        assert_eq!(perft(&b, 3), 8902);
+        let mut b = Board::startpos();
+        assert_eq!(perft(&mut b, 1), 20);
+        assert_eq!(perft(&mut b, 2), 400);
+        assert_eq!(perft(&mut b, 3), 8902);
+        assert_eq!(perft(&mut b, 4), 197_281);
+        assert_eq!(perft(&mut b, 5), 4_865_609);
+        // assert_eq!(perft(&mut b, 6), 119_060_324); // Too slow for normal tests
     }
 
     #[test]

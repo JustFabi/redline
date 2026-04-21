@@ -22,13 +22,12 @@ pub struct MovePicker {
     scores: Vec<i32>,
     bad_captures: MoveList,
     index: usize,
-    killers: [Option<Move>; 2],
     is_qsearch: bool,
     excluded_move: Option<Move>,
     in_check: bool,
 }
 impl MovePicker {
-    pub fn new(tt_move: Option<Move>, killers: [Option<Move>; 2], is_qsearch: bool, in_check: bool) -> Self {
+    pub fn new(tt_move: Option<Move>, is_qsearch: bool, in_check: bool) -> Self {
         Self {
             stage: Stage::TT,
             tt_move,
@@ -36,14 +35,13 @@ impl MovePicker {
             scores: Vec::new(),
             bad_captures: MoveList::new(),
             index: 0,
-            killers,
             is_qsearch,
             excluded_move: None,
             in_check,
         }
     }
 
-    pub fn with_excluded(tt_move: Option<Move>, killers: [Option<Move>; 2], excluded: Option<Move>, in_check: bool) -> Self {
+    pub fn with_excluded(tt_move: Option<Move>, excluded: Option<Move>, in_check: bool) -> Self {
         Self {
             stage: Stage::TT,
             tt_move,
@@ -51,7 +49,6 @@ impl MovePicker {
             scores: Vec::new(),
             bad_captures: MoveList::new(),
             index: 0,
-            killers,
             is_qsearch: false,
             excluded_move: excluded,
             in_check,

@@ -16,6 +16,7 @@ pub struct TTEntry {
     pub score: i32,
     pub node_type: NodeType,
     pub best_move: Option<Move>,
+    #[allow(dead_code)]
     pub age: u8,
 }
 

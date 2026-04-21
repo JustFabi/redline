@@ -4,10 +4,6 @@ use crate::board::bitboard::{count_bits, bit, pop_lsb};
 use crate::movegen::knight::get_knight_attacks;
 use crate::movegen::pawn::get_pawn_attacks;
 
-const KING_SAFETY_TABLE: [i32; 32] = [
-    0,  0,   1,   2,   3,   5,   7,   9,  12,  15,  18,  22,  26,  30,  35,  40,
-    45, 50,  55,  60,  65,  70,  75,  80,  85,  90,  95, 100, 105, 110, 115, 120
-];
 const GAME_PHASE_INC: [i32; 6] = [0, 1, 1, 2, 4, 0]; // Pawn, Knight, Bishop, Rook, Queen, King
 
 static mut KING_ZONE_MASKS: [u64; 64] = [0; 64];
@@ -182,6 +178,29 @@ pub fn evaluate(board: &Board, pawn_table: Option<&mut PawnTable>) -> i32 {
         }
     }
 
+    // ===== Rook on Open/Semi-Open Files =====
+    let mut rook_bonus = 0i32;
+    for color in [Color::White, Color::Black] {
+        let us = color.idx();
+        let them = color.opposite().idx();
+        let multiplier = if color == Color::White { 1 } else { -1 };
+        
+        let mut rooks = board.rooks[us];
+        while rooks != 0 {
+            let sq = pop_lsb(&mut rooks);
+            let file = sq % 8;
+            let file_mask = 0x0101010101010101u64 << file;
+            
+            if (board.pawns[us] & file_mask) == 0 {
+                if (board.pawns[them] & file_mask) == 0 {
+                    rook_bonus += multiplier * 20; // Open file
+                } else {
+                    rook_bonus += multiplier * 10; // Semi-open file
+                }
+            }
+        }
+    }
+
     // ===== Bishop Pair Bonus =====
     let mut bishop_pair = 0i32;
     if count_bits(board.bishops[0]) >= 2 { bishop_pair += 30; }
@@ -194,9 +213,10 @@ pub fn evaluate(board: &Board, pawn_table: Option<&mut PawnTable>) -> i32 {
     let ks_black = king_safety[1];
     let king_safety_total = ks_white - ks_black;
 
-    let score = pst_score + king_safety_total + pawn_score + mobility_score + bishop_pair;
+    let score = pst_score + king_safety_total + pawn_score + mobility_score + bishop_pair + rook_bonus;
 
-    if board.side_to_move == Color::White { score } else { -score }
+    let tempo = 12;
+    if board.side_to_move == Color::White { score + tempo } else { -score + tempo }
 }
 
 fn evaluate_pawns(board: &Board) -> i32 {
@@ -296,7 +316,7 @@ mod tests {
     fn test_initial_eval() {
         init_eval();
         let board = Board::startpos();
-        assert_eq!(evaluate(&board, None), 0);
+        assert_eq!(evaluate(&board, None), 12); // 0 + 12cp tempo bonus
     }
 
     #[test]
@@ -305,7 +325,7 @@ mod tests {
         let mut board = Board::startpos();
         board.remove_piece(52, crate::board::piece::PieceType::Pawn, crate::board::piece::Color::Black);
         let score = evaluate(&board, None);
-        assert!(score > 0);
+        assert!(score > 12);
     }
 
     #[test]
@@ -360,5 +380,42 @@ mod tests {
         board.unmake_move(m, state);
         assert_eq!(board.mg_pst, initial_mg, "mg_pst not restored after unmake");
         assert_eq!(board.eg_pst, initial_eg, "eg_pst not restored after unmake");
+    }
+
+    #[test]
+    fn test_tempo_bonus() {
+        init_eval();
+        let mut board = Board::startpos();
+        let score_white = evaluate(&board, None);
+        
+        board.side_to_move = crate::board::piece::Color::Black;
+        let score_black = evaluate(&board, None);
+        
+        // score_white = (white_eval + tempo) from white perspective
+        // score_black = (black_eval + tempo) from black perspective
+        // Since white_eval = -black_eval, score_white + score_black = 2 * tempo
+        assert_eq!(score_white + score_black, 24, "Tempo bonus should be 12cp per side");
+    }
+
+    #[test]
+    fn test_rook_on_open_file() {
+        init_eval();
+        // Constant material: White Rook g1, White Pawn a2, Black King e8, Black Pawn a7, White King e1
+        
+        // Rook on open file (no pawns on g-file)
+        let board_open = Board::from_fen("4k3/p7/8/8/8/8/P7/4K1R1 w - - 0 1").unwrap();
+        let score_open = evaluate(&board_open, None);
+        
+        // Rook on semi-open file (Black pawn on g7)
+        let board_semi = Board::from_fen("4k1p1/8/8/8/8/8/P7/4K1R1 w - - 0 1").unwrap();
+        let score_semi = evaluate(&board_semi, None);
+        
+        // Rook on closed file (White pawn on g2)
+        let board_closed = Board::from_fen("4k3/p7/8/8/8/8/6P1/4K1R1 w - - 0 1").unwrap();
+        let score_closed = evaluate(&board_closed, None);
+
+        // Expect score_open > score_semi > score_closed
+        assert!(score_open > score_semi, "Open file bonus {} should be greater than semi-open {}", score_open, score_semi);
+        assert!(score_semi > score_closed, "Semi-open file bonus {} should be greater than closed {}", score_semi, score_closed);
     }
 }
