@@ -123,6 +123,28 @@ pub fn evaluate(board: &Board, pawn_table: Option<&mut PawnTable>) -> i32 {
             }
         }
 
+        // Pawn Shelter
+        let file = (king_sq % 8) as i32;
+        for f in (file - 1)..(file + 2) {
+            if f < 0 || f > 7 { continue; }
+            let file_mask = 0x0101010101010101u64 << f;
+            let our_pawns_on_file = board.pawns[us] & file_mask;
+            if our_pawns_on_file != 0 {
+                let pawn_sq = if color == Color::White { our_pawns_on_file.trailing_zeros() } else { 63 - our_pawns_on_file.leading_zeros() } as u8;
+                let rank = pawn_sq / 8;
+                let relative_rank = if color == Color::White { rank } else { 7 - rank };
+                
+                if relative_rank == 1 { // Rank 2
+                    king_safety[us] += 15;
+                } else if relative_rank == 2 { // Rank 3
+                    king_safety[us] += 5;
+                }
+            } else {
+                // Open file near king - penalty
+                king_safety[us] -= 10;
+            }
+        }
+
         // Scale by attacker count: more attackers = disproportionately more danger
         let safety_penalty = match attackers {
             0 => 0,
@@ -130,7 +152,7 @@ pub fn evaluate(board: &Board, pawn_table: Option<&mut PawnTable>) -> i32 {
             2 => attack_weight / 2,
             _ => attack_weight,
         };
-        king_safety[us] = -safety_penalty;
+        king_safety[us] -= safety_penalty;
     }
 
     // ===== Pawn Structure =====
@@ -417,5 +439,18 @@ mod tests {
         // Expect score_open > score_semi > score_closed
         assert!(score_open > score_semi, "Open file bonus {} should be greater than semi-open {}", score_open, score_semi);
         assert!(score_semi > score_closed, "Semi-open file bonus {} should be greater than closed {}", score_semi, score_closed);
+    }
+    #[test]
+    fn test_king_pawn_shelter() {
+        init_eval();
+        // White king on g1, sheltered by f2, g2, h2
+        let board_shelter = Board::from_fen("4k3/8/8/8/8/8/5PPP/6K1 w - - 0 1").unwrap();
+        let score_shelter = evaluate(&board_shelter, None);
+        
+        // White king on g1, no pawns
+        let board_no_shelter = Board::from_fen("4k3/8/8/8/8/8/8/6K1 w - - 0 1").unwrap();
+        let score_no_shelter = evaluate(&board_no_shelter, None);
+        
+        assert!(score_shelter > score_no_shelter, "Sheltered king score {} should be greater than exposed king {}", score_shelter, score_no_shelter);
     }
 }

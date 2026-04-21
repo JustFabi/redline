@@ -1,7 +1,7 @@
 use crate::board::board::Board;
 use crate::board::r#move::{Move, flags};
 use crate::board::piece::PieceType;
-use crate::movegen;
+// Removed unused movegen import
 use crate::engine::eval::{evaluate, PawnTable};
 use crate::engine::tt::{TranspositionTable, NodeType};
 use std::time::{Instant, Duration};
@@ -43,8 +43,10 @@ pub struct Searcher {
     pub is_main_thread: bool,
     pub tt: Arc<TranspositionTable>,
     pub killer_moves: [[Option<Move>; 2]; MAX_PLY],
-    pub history: [[[i32; 64]; 64]; 2],
-    pub counter_moves: [[Option<Move>; 4096]; 2],
+    pub history: Box<[[[i32; 64]; 64]; 2]>,
+    pub capture_history: Box<[[[[i32; 64]; 64]; 6]; 2]>, // [color][attacker_pt][to_sq][victim_pt]
+    pub counter_moves: Box<[[Option<Move>; 4096]; 2]>,
+    pub cmh_history: Box<[[[[i32; 64]; 64]; 64]; 2]>, // [color][prev_to][curr_from][curr_to]
     pub age: u8,
     pub eval_history: [i32; MAX_PLY],
     // Triangular PV table: pv_table[ply] holds the PV from that ply onward.
@@ -52,6 +54,7 @@ pub struct Searcher {
     pv_length: Box<[usize; MAX_PLY]>,
     pub pawn_table: PawnTable,
     lmr_table: [[u32; 64]; 64],
+    pub last_info_time: Instant,
 }
 
 impl Searcher {
@@ -66,14 +69,41 @@ impl Searcher {
                 is_main_thread: true,
                 tt,
                 killer_moves: [[None; 2]; MAX_PLY],
-                history: [[[0; 64]; 64]; 2],
-                counter_moves: [[None; 4096]; 2],
+                history: unsafe {
+                    let layout = std::alloc::Layout::new::<[[[i32; 64]; 64]; 2]>();
+                    let ptr = std::alloc::alloc_zeroed(layout) as *mut [[[i32; 64]; 64]; 2];
+                    Box::from_raw(ptr)
+                },
+                capture_history: unsafe {
+                    let layout = std::alloc::Layout::new::<[[[[i32; 64]; 64]; 6]; 2]>();
+                    let ptr = std::alloc::alloc_zeroed(layout) as *mut [[[[i32; 64]; 64]; 6]; 2];
+                    Box::from_raw(ptr)
+                },
+                counter_moves: unsafe {
+                    let layout = std::alloc::Layout::new::<[[Option<Move>; 4096]; 2]>();
+                    let ptr = std::alloc::alloc_zeroed(layout) as *mut [[Option<Move>; 4096]; 2];
+                    Box::from_raw(ptr)
+                },
+                cmh_history: unsafe {
+                    let layout = std::alloc::Layout::new::<[[[[i32; 64]; 64]; 64]; 2]>();
+                    let ptr = std::alloc::alloc_zeroed(layout) as *mut [[[[i32; 64]; 64]; 64]; 2];
+                    Box::from_raw(ptr)
+                },
                 age: 0,
                 eval_history: [0; MAX_PLY],
-                pv_table: (0..MAX_PLY).map(|_| [None; MAX_PLY]).collect::<Vec<_>>().try_into().unwrap_or_else(|_| Box::new([[None; MAX_PLY]; MAX_PLY])),
+                pv_table: {
+                    let mut v: Vec<[Option<Move>; MAX_PLY]> = Vec::with_capacity(MAX_PLY);
+                    for _ in 0..MAX_PLY {
+                        v.push([None; MAX_PLY]);
+                    }
+                    let boxed_slice = v.into_boxed_slice();
+                    let raw_ptr = Box::into_raw(boxed_slice) as *mut [[Option<Move>; MAX_PLY]; MAX_PLY];
+                    unsafe { Box::from_raw(raw_ptr) }
+                },
                 pv_length: Box::new([0; MAX_PLY]),
                 pawn_table: PawnTable::new(8192),
                 lmr_table: build_lmr_table(),
+                last_info_time: Instant::now(),
             }
         }
 
@@ -129,17 +159,19 @@ impl Searcher {
                 let result = self.internal_search(board, depth);
                 self.stop.store(true, Ordering::SeqCst);
                 result
-            })
-            .unwrap()
-        }
+            }).unwrap()
+    }
 
     fn internal_search(&mut self, board: &mut Board, depth: u32) -> SearchResult {
+        #[allow(unused_assignments)]
         let mut best_move = None;
         let mut best_score = -INFINITY;
+        #[allow(unused_assignments)]
         let mut previous_best_move = None;
+        #[allow(unused_assignments)]
         let mut previous_score = -INFINITY;
         let mut last_completed_depth = 0;
-        let mut info_lines = Vec::new();
+        self.last_info_time = Instant::now();
 
         for d in 1..=depth {
             self.seldepth = 0;
@@ -208,9 +240,7 @@ impl Searcher {
 
             // Extract PV from triangular table (main thread only)
             if self.is_main_thread {
-                self.pv_length[0] = 0;
                 // PV is already populated by negamax via the triangular table.
-                // Copy it out for UCI output.
             }
 
             let elapsed = self.start_time.elapsed().as_millis() as u64;
@@ -229,7 +259,13 @@ impl Searcher {
             );
 
             println!("{}", info);
-            info_lines.push(info);
+            
+            previous_best_move = best_move;
+            previous_score = best_score;
+
+            if best_score.abs() > MATE_VALUE - 1000 {
+                break;
+            }
 
             if let Some(soft) = self.soft_time_limit {
                 let elapsed_dur = self.start_time.elapsed();
@@ -247,8 +283,6 @@ impl Searcher {
                         if elapsed_dur >= hard {
                             break;
                         }
-                    } else {
-                        break;
                     }
                 }
             }
@@ -273,6 +307,9 @@ impl Searcher {
         ply: u32,
         excluded_move: Option<Move>,
     ) -> (Option<Move>, i32) {
+        if (ply as usize) < MAX_PLY {
+            self.pv_length[ply as usize] = 0;
+        }
 
         let is_pv_node = beta - alpha > 1;
 
@@ -422,9 +459,9 @@ impl Searcher {
                 }
             }
 
-            // LMP
+            // LMP: Late Move Pruning
             if !is_pv_node && !in_check && depth <= 4 && is_quiet &&
-                legal_moves >= (3 + 3 * depth as usize * depth as usize / 2) {
+                legal_moves >= (3 + 3 * depth as usize * depth as usize / (if improving { 1 } else { 2 })) {
                 continue;
             }
 
@@ -446,7 +483,7 @@ impl Searcher {
 
             if ply == 0 && self.is_main_thread {
                 let elapsed = self.start_time.elapsed().as_millis();
-                if elapsed > 300 {
+                if elapsed > 100 {
                     println!("info depth {} currmove {} currmovenumber {}", depth, m, legal_moves + 1);
                 }
             }
@@ -552,6 +589,9 @@ impl Searcher {
     }
 
     fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u32) -> i32 {
+        if (ply as usize) < MAX_PLY {
+            self.pv_length[ply as usize] = 0;
+        }
             // Node counting is done in negamax; avoid double-counting here.
             // Only check time periodically.
             if (self.nodes.load(Ordering::Relaxed) & 2047) == 0 { self.check_time(); }
@@ -634,9 +674,9 @@ impl Searcher {
                 }
             }
 
-            if in_check && legal_moves == 0 { return -MATE_VALUE + ply as i32; }
-            best_score
-        }
+        if in_check && legal_moves == 0 { return -MATE_VALUE + ply as i32; }
+        best_score
+    }
 
     pub fn pick_move(&self, moves: &mut [Move], scores: &mut [i32], start: usize) {
         let mut best_idx = start;
@@ -664,7 +704,12 @@ impl Searcher {
             let attacker = board.pieces[m.from() as usize];
             
             // MVV-LVA base score
-            let score = 50_000 + 10 * self.val(victim) - self.val(attacker);
+            let mut score = 50_000 + 10 * self.val(victim) - self.val(attacker);
+
+            // Add capture history bonus
+            let victim_idx = (victim as usize).min(5);
+            let attacker_idx = (attacker as usize).min(5);
+            score += self.capture_history[board.side_to_move.idx()][attacker_idx][m.to() as usize][victim_idx] / 128;
             
             if is_qsearch {
                 // In qsearch, we can afford SEE if it's not a clear win
@@ -709,7 +754,15 @@ impl Searcher {
         }
 
         // History heuristic
-        self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize] / 10
+        let mut score = self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize] / 10;
+        
+        // Countermove history
+        if let Some(last_move) = board.last_move {
+            let prev_to = last_move.to() as usize;
+            score += self.cmh_history[board.side_to_move.idx()][prev_to][m.from() as usize][m.to() as usize] / 20;
+        }
+        
+        score
     }
 
     pub fn val(&self, pt: PieceType) -> i32 {
@@ -725,15 +778,41 @@ impl Searcher {
     }
 
     fn check_time(&mut self) {
+        let elapsed = self.start_time.elapsed();
         let limit = self.hard_time_limit.or(self.soft_time_limit);
         if let Some(l) = limit {
-            if self.start_time.elapsed() >= l {
+            if elapsed >= l {
                 self.stop.store(true, Ordering::Relaxed);
             }
+        }
+
+        // Periodic info update every 1000ms
+        if self.is_main_thread && self.last_info_time.elapsed() >= Duration::from_millis(1000) {
+            self.last_info_time = Instant::now();
+            let nodes = self.nodes.load(Ordering::Relaxed);
+            let time = elapsed.as_millis() as u64;
+            let nps = if time > 0 { (nodes * 1000) / time } else { 0 };
+            println!("info nodes {} nps {} time {} hashfull {}", nodes, nps, time, self.tt.hashfull());
         }
     }
 
     fn update_heuristics(&mut self, m: Move, board: &Board, depth: u32, ply: u32) {
+        let bonus = (depth * depth).min(400) as i32;
+        let us = board.side_to_move.idx();
+
+        if (m.flags() & flags::CAPTURE) != 0 {
+            // Capture history bonus
+            let attacker = board.pieces[m.from() as usize] as usize;
+            let victim = board.pieces[m.to() as usize] as usize;
+            let attacker_idx = attacker.min(5);
+            let victim_idx = victim.min(5);
+            let entry = &mut self.capture_history[us][attacker_idx][m.to() as usize][victim_idx];
+            let current = *entry as i64;
+            let b = bonus as i64;
+            *entry = (current + b - (current * b / 32_768)) as i32;
+            return; // Don't update quiet heuristics for captures
+        }
+
         // Killer moves
         if ply < MAX_PLY as u32 && Some(m) != self.killer_moves[ply as usize][0] {
             self.killer_moves[ply as usize][1] = self.killer_moves[ply as usize][0];
@@ -742,16 +821,23 @@ impl Searcher {
 
         // History with gravity (positive bonus for the cutoff move)
         let bonus = (depth * depth).min(400) as i32;
+        
+        // Main history
         let entry =
             &mut self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
         let current = *entry as i64;
         let b = bonus as i64;
         *entry = (current + b - (current * b / 32_768)) as i32;
 
-        // Counter move — store m as the reply to the opponent's last move.
+        // Countermove history
         if let Some(last_move) = board.last_move {
             let last_idx = (last_move.from() as usize) | ((last_move.to() as usize) << 6);
             self.counter_moves[board.side_to_move.idx()][last_idx] = Some(m);
+            
+            let prev_to = last_move.to() as usize;
+            let entry_cmh = &mut self.cmh_history[board.side_to_move.idx()][prev_to][m.from() as usize][m.to() as usize];
+            let current_cmh = *entry_cmh as i64;
+            *entry_cmh = (current_cmh + b - (current_cmh * b / 32_768)) as i32;
         }
     }
 
@@ -759,12 +845,36 @@ impl Searcher {
     /// searched but failed to produce a beta cutoff.
     fn apply_history_malus(&mut self, m: Move, board: &Board, depth: u32) {
         let malus = -((depth * depth).min(400) as i32);
+        let us = board.side_to_move.idx();
+
+        if (m.flags() & flags::CAPTURE) != 0 {
+            // Capture history malus
+            let attacker = board.pieces[m.from() as usize] as usize;
+            let victim = board.pieces[m.to() as usize] as usize;
+            let attacker_idx = attacker.min(5);
+            let victim_idx = victim.min(5);
+            let entry = &mut self.capture_history[us][attacker_idx][m.to() as usize][victim_idx];
+            let current = *entry as i64;
+            let b = malus as i64;
+            *entry = (current + b - (current.abs() * b / 32_768)) as i32;
+            return;
+        }
+
+        // Main history malus
         let entry =
             &mut self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
         let current = *entry as i64;
         let b = malus as i64;
         // Same gravity formula as the bonus path, keeping values bounded.
-       *entry = (current + b - (current.abs() * b / 32_768)) as i32;
+        *entry = (current + b - (current.abs() * b / 32_768)) as i32;
+
+        // Countermove history malus
+        if let Some(last_move) = board.last_move {
+            let prev_to = last_move.to() as usize;
+            let entry_cmh = &mut self.cmh_history[board.side_to_move.idx()][prev_to][m.from() as usize][m.to() as usize];
+            let current_cmh = *entry_cmh as i64;
+            *entry_cmh = (current_cmh + b - (current_cmh.abs() * b / 32_768)) as i32;
+        }
     }
 }
 
