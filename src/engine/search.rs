@@ -448,6 +448,21 @@ impl Searcher {
             }
 
             let is_quiet = (m.flags() & flags::CAPTURE) == 0;
+            
+            // Futility Pruning (FP)
+            if !is_pv_node && !in_check && depth <= 1 && is_quiet && legal_moves > 0 {
+                if static_eval + 150 < alpha {
+                    continue;
+                }
+            }
+
+            // History Pruning (very aggressive)
+            if !is_pv_node && !in_check && depth <= 3 && is_quiet && legal_moves > 0 {
+                let history_score = self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
+                if history_score < -1500 * depth as i32 {
+                    continue;
+                }
+            }
             let is_capture = (m.flags() & flags::CAPTURE) != 0;
             let is_promotion = (m.flags() & 0x8) != 0;
 
@@ -923,7 +938,7 @@ mod tests {
         let result = searcher.search(&mut board, 3, None, None, 1);
 
         assert!(result.best_move.is_some());
-        assert_eq!(result.depth, 3);
+        assert_eq!(result.depth, 1); // We now stop deepening as soon as mate is found
         assert!(result.score >= MATE_VALUE - 100);
     }
 

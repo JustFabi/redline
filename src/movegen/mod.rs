@@ -3,6 +3,7 @@ pub mod knight;
 pub mod sliding;
 pub mod king;
 pub mod move_list;
+pub mod perft_regression;
 
 use crate::board::board::Board;
 use crate::board::r#move::flags;

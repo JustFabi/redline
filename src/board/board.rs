@@ -1310,6 +1310,22 @@ impl Board {
         h ^= ZOBRIST.hash_en_passant(self.en_passant_square);
         h
     }
+
+    pub fn perft(&mut self, depth: u32) -> u64 {
+        if depth == 0 { return 1; }
+        let mut nodes = 0;
+        let moves = crate::movegen::generate_pseudo_legal_moves(self);
+        let (pinned, checkers) = self.pins_and_checkers(self.side_to_move);
+        
+        for i in 0..moves.len() {
+            let m = moves.get(i);
+            if !self.is_legal_fast(m, pinned, checkers) { continue; }
+            let state = self.make_move(m);
+            nodes += self.perft(depth - 1);
+            self.unmake_move(m, state);
+        }
+        nodes
+    }
 }
 
 #[cfg(test)]
