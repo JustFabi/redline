@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const INFINITY: i32 = 1000000;
 const MATE_VALUE: i32 = 100000;
-const MAX_PLY: usize = 256;
+const MAX_PLY: usize = 128; // Reduced from 256 since triangular PV table is MAX_PLY^2
 const DELTA_MARGIN: i32 = 200; // Safety margin for delta pruning
 const SEE_PIECE_VALUES: [i32; 7] = [100, 325, 335, 500, 975, 0, 0]; // P, N, B, R, Q, K, Empty
 
@@ -47,7 +47,9 @@ pub struct Searcher {
     pub counter_moves: [[Option<Move>; 4096]; 2],
     pub age: u8,
     pub eval_history: [i32; MAX_PLY],
-    pub pv: Vec<Move>,
+    // Triangular PV table: pv_table[ply] holds the PV from that ply onward.
+    pv_table: Box<[[Option<Move>; MAX_PLY]; MAX_PLY]>,
+    pv_length: Box<[usize; MAX_PLY]>,
     pub pawn_table: PawnTable,
     lmr_table: [[u32; 64]; 64],
 }
@@ -68,7 +70,8 @@ impl Searcher {
                 counter_moves: [[None; 4096]; 2],
                 age: 0,
                 eval_history: [0; MAX_PLY],
-                pv: Vec::new(),
+                pv_table: (0..MAX_PLY).map(|_| [None; MAX_PLY]).collect::<Vec<_>>().try_into().unwrap_or_else(|_| Box::new([[None; MAX_PLY]; MAX_PLY])),
+                pv_length: Box::new([0; MAX_PLY]),
                 pawn_table: PawnTable::new(8192),
                 lmr_table: build_lmr_table(),
             }
@@ -203,15 +206,22 @@ impl Searcher {
 
             last_completed_depth = d;
 
+            // Extract PV from triangular table (main thread only)
             if self.is_main_thread {
-                self.pv = self.extract_pv(board);
+                self.pv_length[0] = 0;
+                // PV is already populated by negamax via the triangular table.
+                // Copy it out for UCI output.
             }
 
             let elapsed = self.start_time.elapsed().as_millis() as u64;
             let total_nodes = self.nodes.load(Ordering::Relaxed);
             let nps = if elapsed > 0 { (total_nodes * 1000) / elapsed } else { 0 };
 
-            let pv_str = self.pv.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" ");
+            let pv_str = (0..self.pv_length[0])
+                .filter_map(|i| self.pv_table[0][i])
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
 
             let info = format!(
                 "info depth {} seldepth {} multipv 1 score {} nodes {} nps {} hashfull {} tbhits 0 time {} pv {}",
@@ -315,13 +325,10 @@ impl Searcher {
             }
         }
 
-        // IID
-        if is_pv_node && tt_move.is_none() && depth >= 4 {
-            let d = depth - 2;
-            self.negamax(board, d, alpha, beta, ply, None);
-            if let Some(entry) = self.tt.probe(board.hash) {
-                tt_move = entry.best_move;
-            }
+        // IIR: Internal Iterative Reduction — reduce depth when no TT move instead of
+        // doing an expensive re-search (IID). Much cheaper and nearly as effective.
+        if tt_move.is_none() && depth >= 4 {
+            depth -= 1;
         }
 
         if depth == 0 {
@@ -387,6 +394,9 @@ impl Searcher {
         let mut best_m = None;
         let mut max_score = -INFINITY;
         let old_alpha = alpha;
+
+        // Initialize this ply's PV length.
+        if (ply as usize) < MAX_PLY { self.pv_length[ply as usize] = 0; }
 
         let mut is_first_move = true;
         let mut picker = if let Some(excluded) = excluded_move {
@@ -457,6 +467,13 @@ impl Searcher {
 
                 if !improving { reduction += 1; }
 
+                // History-based LMR adjustment: reduce more for moves with poor history,
+                // reduce less for moves with good history.
+                let hist = self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
+                let hist_adj = (hist / 8_000).clamp(-2, 2);
+                let reduction = reduction.saturating_add_signed(-hist_adj);
+                let reduction = reduction.min(depth - 2);
+
                 let d = depth.saturating_sub(reduction + 1);
 
                 (_, score) = self.negamax(board, d, -alpha - 1, -alpha, ply + 1, None);
@@ -491,6 +508,17 @@ impl Searcher {
 
             if score > alpha {
                 alpha = score;
+
+                // Update triangular PV table
+                if (ply as usize) < MAX_PLY {
+                    self.pv_table[ply as usize][0] = Some(m);
+                    let next_len = if ply as usize + 1 < MAX_PLY { self.pv_length[ply as usize + 1] } else { 0 };
+                    for i in 0..next_len {
+                        self.pv_table[ply as usize][i + 1] = self.pv_table[ply as usize + 1][i];
+                    }
+                    self.pv_length[ply as usize] = 1 + next_len;
+                }
+
                 if alpha >= beta {
                     if is_quiet { self.update_heuristics(m, board, depth, ply); }
                     break;
@@ -737,46 +765,6 @@ impl Searcher {
         let b = malus as i64;
         // Same gravity formula as the bonus path, keeping values bounded.
        *entry = (current + b - (current.abs() * b / 32_768)) as i32;
-    }
-
-    fn extract_pv(&self, board: &mut Board) -> Vec<Move> {
-        let mut pv = Vec::new();
-        let mut states = Vec::new();
-        let mut visited = Vec::new();
-
-        // Limit the maximum PV length to prevent overly long extractions
-        let mut max_len = 64;
-
-        while max_len > 0 {
-            if visited.contains(&board.hash) {
-                break;
-            }
-            visited.push(board.hash);
-
-            if let Some(entry) = self.tt.probe(board.hash) {
-                if let Some(m) = entry.best_move {
-                    // Quick legality check to avoid panics on corrupted or colliding TT entries
-                    let pseudo_moves = movegen::generate_pseudo_legal_moves(board);
-                    if !pseudo_moves.as_slice().contains(&m) || !board.is_legal(m) {
-                        break;
-                    }
-                    pv.push(m);
-                    states.push(board.make_move(m));
-                    max_len -= 1;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // Unmake moves to restore board state
-        for (m, state) in pv.iter().rev().zip(states.into_iter().rev()) {
-            board.unmake_move(*m, state);
-        }
-
-        pv
     }
 }
 

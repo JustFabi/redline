@@ -46,11 +46,13 @@ impl MoveList {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn as_slice(&self) -> &[Move] {
         &self.moves[..self.count]
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn as_mut_slice(&mut self) -> &mut [Move] {
         &mut self.moves[..self.count]
     }
