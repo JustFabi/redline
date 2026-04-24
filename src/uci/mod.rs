@@ -81,6 +81,12 @@ impl Uci {
                 }
                 vec![]
             }
+            "elo" => {
+                let num_games = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                let depth = parts.get(2).and_then(|s| s.parse::<u32>().ok());
+                crate::engine::elo_test::run_elo_test(num_games, depth);
+                vec![]
+            }
             _ => vec![],
         }
     }

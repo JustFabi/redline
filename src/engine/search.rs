@@ -27,6 +27,60 @@ fn build_lmr_table() -> [[u32; 64]; 64] {
     table
 }
 
+#[derive(Clone, Copy)]
+pub struct SearchSettings {
+    pub aspiration_windows: bool,
+    pub mate_distance_pruning: bool,
+    pub iir: bool,
+    pub rfp: bool,
+    pub nmp: bool,
+    pub singular_extensions: bool,
+    pub fp: bool,
+    pub history_pruning: bool,
+    pub see_pruning: bool,
+    pub lmp: bool,
+    pub lmr: bool,
+    pub delta_pruning: bool,
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self {
+            aspiration_windows: true,
+            mate_distance_pruning: true,
+            iir: true,
+            rfp: true,
+            nmp: true,
+            singular_extensions: true,
+            fp: true,
+            history_pruning: true,
+            see_pruning: true,
+            lmp: true,
+            lmr: true,
+            delta_pruning: true,
+        }
+    }
+}
+
+impl SearchSettings {
+    pub fn none() -> Self {
+        Self {
+            aspiration_windows: false,
+            mate_distance_pruning: false,
+            iir: false,
+            rfp: false,
+            nmp: false,
+            singular_extensions: false,
+            fp: false,
+            history_pruning: false,
+            see_pruning: false,
+            lmp: false,
+            lmr: false,
+            delta_pruning: false,
+        }
+    }
+}
+
 pub struct SearchResult {
     pub best_move: Option<Move>,
     pub score: i32,
@@ -55,6 +109,7 @@ pub struct Searcher {
     pub pawn_table: PawnTable,
     lmr_table: [[u32; 64]; 64],
     pub last_info_time: Instant,
+    pub settings: SearchSettings,
 }
 
 impl Searcher {
@@ -104,6 +159,7 @@ impl Searcher {
                 pawn_table: PawnTable::new(8192),
                 lmr_table: build_lmr_table(),
                 last_info_time: Instant::now(),
+                settings: SearchSettings::default(),
             }
         }
 
@@ -179,7 +235,7 @@ impl Searcher {
             let mut beta = INFINITY;
             let mut delta = 20;
 
-            if d >= 3 && best_score.abs() < MATE_VALUE - 1000 {
+            if self.settings.aspiration_windows && d >= 3 && best_score.abs() < MATE_VALUE - 1000 {
                 alpha = (best_score - delta).max(-INFINITY);
                 beta = (best_score + delta).min(INFINITY);
             }
@@ -260,9 +316,6 @@ impl Searcher {
 
             println!("{}", info);
             
-            previous_best_move = best_move;
-            previous_score = best_score;
-
             if best_score.abs() > MATE_VALUE - 1000 {
                 break;
             }
@@ -331,9 +384,11 @@ impl Searcher {
 
         if ply > 0 {
             // Mate distance pruning
-            alpha = alpha.max(-MATE_VALUE + ply as i32);
-            beta = beta.min(MATE_VALUE - ply as i32 - 1);
-            if alpha >= beta { return (None, alpha); }
+            if self.settings.mate_distance_pruning {
+                alpha = alpha.max(-MATE_VALUE + ply as i32);
+                beta = beta.min(MATE_VALUE - ply as i32 - 1);
+                if alpha >= beta { return (None, alpha); }
+            }
         }
 
         self.seldepth = self.seldepth.max(ply);
@@ -364,7 +419,7 @@ impl Searcher {
 
         // IIR: Internal Iterative Reduction — reduce depth when no TT move instead of
         // doing an expensive re-search (IID). Much cheaper and nearly as effective.
-        if tt_move.is_none() && depth >= 4 {
+        if self.settings.iir && tt_move.is_none() && depth >= 4 {
             depth -= 1;
         }
 
@@ -377,7 +432,7 @@ impl Searcher {
         let improving = ply >= 2 && static_eval > self.eval_history[ply as usize - 2];
 
         // RFP
-        if !is_pv_node && depth <= 8 && !in_check && ply > 0 {
+        if self.settings.rfp && !is_pv_node && depth <= 8 && !in_check && ply > 0 {
             let margin = if improving { 80 } else { 120 } * depth as i32;
             if static_eval - margin >= beta {
                 return (None, static_eval - margin);
@@ -385,7 +440,7 @@ impl Searcher {
         }
 
         // Null move
-        if !is_pv_node && depth >= 3 && !in_check && ply > 0 {
+        if self.settings.nmp && !is_pv_node && depth >= 3 && !in_check && ply > 0 {
             if board.has_non_pawn_material(board.side_to_move)
                 && board.has_non_pawn_material(board.side_to_move.opposite()) {
 
@@ -406,7 +461,7 @@ impl Searcher {
 
         // Singular Extension
         let mut extension = 0;
-        if depth >= 8 && tt_move.is_some() && excluded_move.is_none() {
+        if self.settings.singular_extensions && depth >= 8 && tt_move.is_some() && excluded_move.is_none() {
             if let Some(ref entry) = tt_entry {
                 if entry.depth >= depth as u8 - 3 && entry.node_type != NodeType::Alpha {
                     let tt_score = if entry.score > MATE_VALUE - 1000 { entry.score - ply as i32 }
@@ -450,14 +505,14 @@ impl Searcher {
             let is_quiet = (m.flags() & flags::CAPTURE) == 0;
             
             // Futility Pruning (FP)
-            if !is_pv_node && !in_check && depth <= 1 && is_quiet && legal_moves > 0 {
+            if self.settings.fp && !is_pv_node && !in_check && depth <= 1 && is_quiet && legal_moves > 0 {
                 if static_eval + 150 < alpha {
                     continue;
                 }
             }
 
             // History Pruning (very aggressive)
-            if !is_pv_node && !in_check && depth <= 3 && is_quiet && legal_moves > 0 {
+            if self.settings.history_pruning && !is_pv_node && !in_check && depth <= 3 && is_quiet && legal_moves > 0 {
                 let history_score = self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
                 if history_score < -1500 * depth as i32 {
                     continue;
@@ -467,7 +522,7 @@ impl Searcher {
             let is_promotion = (m.flags() & 0x8) != 0;
 
             // SEE pruning (must be before make_move — SEE inspects the pre-move board)
-            if !is_pv_node && is_capture && depth <= 8 && legal_moves > 0 {
+            if self.settings.see_pruning && !is_pv_node && is_capture && depth <= 8 && legal_moves > 0 {
                 let see = board.see(m);
                 if see < -50 * (depth as i32) * (depth as i32) {
                     continue;
@@ -475,13 +530,13 @@ impl Searcher {
             }
 
             // LMP: Late Move Pruning
-            if !is_pv_node && !in_check && depth <= 4 && is_quiet &&
+            if self.settings.lmp && !is_pv_node && !in_check && depth <= 4 && is_quiet &&
                 legal_moves >= (3 + 3 * depth as usize * depth as usize / (if improving { 1 } else { 2 })) {
                 continue;
             }
 
             // Futility
-            if !is_pv_node && depth <= 6 && !in_check && is_quiet && !is_promotion && legal_moves > 0 {
+            if self.settings.fp && !is_pv_node && depth <= 6 && !in_check && is_quiet && !is_promotion && legal_moves > 0 {
                 let margin = 120 * depth as i32 + 50;
                 if static_eval + margin <= alpha {
                     continue;
@@ -489,7 +544,7 @@ impl Searcher {
             }
 
             // History Pruning: skip quiet moves with terrible history at shallow depths
-            if !is_pv_node && !in_check && is_quiet && depth <= 3 && legal_moves > 0 {
+            if self.settings.history_pruning && !is_pv_node && !in_check && is_quiet && depth <= 3 && legal_moves > 0 {
                 let hist = self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
                 if hist < -(depth as i32 * depth as i32 * 100) {
                     continue;
@@ -512,7 +567,7 @@ impl Searcher {
             let is_pv_move = is_pv_node && is_first_move;
 
             // LMR
-            if !is_pv_move && depth >= 3 && legal_moves > 1 && is_quiet && !is_promotion && Some(m) != tt_move {
+            if self.settings.lmr && !is_pv_move && depth >= 3 && legal_moves > 1 && is_quiet && !is_promotion && Some(m) != tt_move {
                 let mut reduction = self.lmr_table[depth.min(63) as usize][legal_moves.min(63) as usize];
 
                 reduction = reduction.min(depth - 2);
@@ -631,9 +686,11 @@ impl Searcher {
                 if stand_pat >= beta { return stand_pat; }
 
                 // Delta Pruning: if even the biggest possible gain can't reach alpha, bail
-                let big_delta = SEE_PIECE_VALUES[4] + DELTA_MARGIN; // Queen value + margin
-                if stand_pat + big_delta < alpha {
-                    return stand_pat;
+                if self.settings.delta_pruning {
+                    let big_delta = SEE_PIECE_VALUES[4] + DELTA_MARGIN; // Queen value + margin
+                    if stand_pat + big_delta < alpha {
+                        return stand_pat;
+                    }
                 }
 
                 if stand_pat > alpha { alpha = stand_pat; }
@@ -664,7 +721,7 @@ impl Searcher {
                 if !board.is_legal_fast(m, pinned, checkers) { continue; }
 
                 // Delta Pruning per-move: skip captures that can't raise alpha
-                if !in_check {
+                if self.settings.delta_pruning && !in_check {
                     let captured_pt = board.pieces[m.to() as usize];
                     let captured_val = SEE_PIECE_VALUES[captured_pt as usize];
                     if stand_pat + captured_val + DELTA_MARGIN < alpha {
