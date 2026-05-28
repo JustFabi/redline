@@ -57,7 +57,7 @@ impl Default for SearchSettings {
             iir: true,
             rfp: true,
             nmp: true,
-            singular_extensions: false,
+            singular_extensions: true,
             fp: true,
             history_pruning: true,
             see_pruning: true,
@@ -411,12 +411,15 @@ impl Searcher {
         if in_check && ply < 16 { depth += 1; }
 
         let mut tt_move = None;
+        let mut tt_value = VALUE_NONE;
+        let mut tt_depth = 0;
+        let mut tt_bound = NodeType::Exact;
 
         if let Some(entry) = self.tt.probe(board.hash) {
             tt_move = entry.best_move;
-            let tt_value = self.value_from_tt(entry.score, ply);
-            let tt_depth = entry.depth;
-            let tt_bound = entry.node_type;
+            tt_value = self.value_from_tt(entry.score, ply);
+            tt_depth = entry.depth;
+            tt_bound = entry.node_type;
 
             if !is_pv_node && excluded_move.is_none() && tt_depth >= depth as u8 && tt_value != VALUE_NONE {
                 match tt_bound {
@@ -428,7 +431,7 @@ impl Searcher {
             }
         }
 
-        if self.settings.iir && !is_pv_node && tt_move.is_none() && depth >= 6 {
+        if self.settings.iir && tt_move.is_none() && depth >= 4 {
             depth -= 1;
         }
 
@@ -457,8 +460,22 @@ impl Searcher {
             }
         }
 
-        let extension = 0;
-        // Singular extensions could go here...
+        let mut extension = 0;
+        if self.settings.singular_extensions 
+            && !is_pv_node 
+            && depth >= 8 
+            && excluded_move.is_none() 
+            && tt_move.is_some() 
+            && tt_depth >= depth as u8 - 3 
+            && tt_bound != NodeType::Alpha 
+            && tt_value.abs() < MATE_VALUE - 1000 
+        {
+            let s_beta = tt_value - depth as i32;
+            let (_, s_score) = self.negamax(board, depth / 2, s_beta - 1, s_beta, ply, tt_move);
+            if s_score < s_beta {
+                extension = 1;
+            }
+        }
 
         if !is_pv_node && depth >= 3 && excluded_move.is_none() && beta.abs() < MATE_VALUE - 1000 {
             let probcut_beta = beta + 200 - if improving { 49 } else { 0 };
@@ -491,6 +508,13 @@ impl Searcher {
 
         let futility_move_count = (3 + depth * depth) / (2 - if improving { 1 } else { 0 });
         let us_idx = board.side_to_move.idx();
+        let futility_value = if self.settings.fp && !is_pv_node && !in_check && depth <= 6 {
+            Some(static_eval + depth as i32 * 150)
+        } else {
+            None
+        };
+        let mut quiets_tried = [Move::from_raw(0); 64];
+        let mut quiets_tried_count = 0usize;
 
         while let Some(m) = picker.next(self, board, ply) {
             if !board.is_legal_fast(m, pinned, checkers) { continue; }
@@ -510,6 +534,16 @@ impl Searcher {
             if self.settings.lmp && !is_pv_node && depth < 10 && !in_check && is_quiet && legal_moves >= futility_move_count {
                 picker.skip_quiets = true;
                 continue;
+            }
+
+            // Futility pruning: if static eval + margin < alpha, quiet moves can't raise alpha
+            if is_quiet && !is_first_move && !in_check {
+                if let Some(fv) = futility_value {
+                    if fv <= alpha {
+                        picker.skip_quiets = true;
+                        continue;
+                    }
+                }
             }
 
             if self.settings.see_pruning && !is_pv_node && depth <= 8 && legal_moves > 1 {
@@ -533,8 +567,18 @@ impl Searcher {
             if self.settings.lmr && !is_first_move && depth >= 3 && is_quiet && Some(m) != tt_move {
                 let mut r = self.reduction(improving, depth, legal_moves as i32, beta - alpha, self.root_delta);
                 if is_pv_node { r -= 1024; }
+                // Cut node bonus: increase reduction at cut nodes (non-PV, beta = alpha+1)
+                if !is_pv_node { r += 1024; }
                 let hist = self.history[us_idx][m.from() as usize][m.to() as usize];
                 r -= hist * 850 / 8192;
+                // Continuation history adjustment
+                let cur_pt = (board.pieces[m.from() as usize] as usize).min(6);
+                let cur_to = m.to() as usize;
+                if ply >= 1 && (ply as usize - 1) < MAX_PLY {
+                    let (prev_pt, prev_to) = self.move_stack[ply as usize - 1];
+                    let ch = self.cont_history[0][prev_pt.min(6)][prev_to][cur_pt][cur_to];
+                    r -= ch * 512 / 8192;
+                }
                 
                 let d = 1.max(std::cmp::min(depth as i32 - 1 - r / 1024, depth as i32 - 1)) as u32;
                 (_, score) = self.negamax(board, d, -alpha - 1, -alpha, ply + 1, None);
@@ -560,6 +604,7 @@ impl Searcher {
             }
 
             board.unmake_move(m, state);
+            if self.stop.load(Ordering::Relaxed) { break; }
             if score > max_score { max_score = score; best_m = Some(m); }
             if score > alpha {
                 alpha = score;
@@ -570,10 +615,20 @@ impl Searcher {
                     self.pv_length[ply as usize] = 1 + next_len;
                 }
                 if alpha >= beta {
-                    if is_quiet { self.update_heuristics(m, board, depth, ply, tt_move); }
+                    if is_quiet {
+                        self.update_heuristics(m, board, depth, ply, tt_move);
+                        // Apply malus to ALL previously tried quiet moves that didn't cause cutoff
+                        for i in 0..quiets_tried_count {
+                            self.apply_history_malus(quiets_tried[i], board, depth, legal_moves as u32, ply);
+                        }
+                    }
                     break;
                 }
-            } else if is_quiet { self.apply_history_malus(m, board, depth, legal_moves as u32, ply); }
+            }
+            if is_quiet && quiets_tried_count < 64 {
+                quiets_tried[quiets_tried_count] = m;
+                quiets_tried_count += 1;
+            }
         }
 
         if legal_moves == 0 { return (None, if in_check { -MATE_VALUE + ply as i32 } else { 0 }); }

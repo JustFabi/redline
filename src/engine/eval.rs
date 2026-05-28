@@ -46,6 +46,9 @@ const FILE_MASKS: [u64; 8] = [
 ];
 
 static mut KING_ZONE_MASKS: [u64; 64] = [0; 64];
+static mut KING_ZONE_KNIGHT_ATTACKS: [u64; 64] = [0; 64];
+static mut KING_ZONE_BISHOP_RAYS: [u64; 64] = [0; 64];
+static mut KING_ZONE_ROOK_RAYS: [u64; 64] = [0; 64];
 static mut PASSED_PAWN_MASKS: [[u64; 64]; 2] = [[0; 64]; 2];
 static mut ADJACENT_FILES_MASKS: [u64; 8] = [0; 8];
 static mut OUTPOST_MASKS: [[u64; 64]; 2] = [[0; 64]; 2];
@@ -53,7 +56,29 @@ static mut OUTPOST_MASKS: [[u64; 64]; 2] = [[0; 64]; 2];
 pub fn init_eval() {
     unsafe {
         for sq in 0..64 {
-            KING_ZONE_MASKS[sq as usize] = generate_king_zone(sq);
+            let zone = generate_king_zone(sq);
+            KING_ZONE_MASKS[sq as usize] = zone;
+            let mut knight_attacks = 0;
+            for z_sq in 0..64 {
+                if (zone & bit(z_sq)) != 0 {
+                    knight_attacks |= get_knight_attacks(z_sq);
+                }
+            }
+            KING_ZONE_KNIGHT_ATTACKS[sq as usize] = knight_attacks;
+            // Precompute bishop/rook ray projections from the king zone.
+            // These are the union of all bishop/rook attacks from every square
+            // in the king zone, using an empty board. An enemy slider can attack
+            // the king zone only if it sits on one of these rays.
+            let mut bishop_rays = 0u64;
+            let mut rook_rays = 0u64;
+            for z_sq in 0..64u8 {
+                if (zone & bit(z_sq)) != 0 {
+                    bishop_rays |= get_bishop_attacks(z_sq, 0);
+                    rook_rays |= get_rook_attacks(z_sq, 0);
+                }
+            }
+            KING_ZONE_BISHOP_RAYS[sq as usize] = bishop_rays;
+            KING_ZONE_ROOK_RAYS[sq as usize] = rook_rays;
             PASSED_PAWN_MASKS[0][sq as usize] = generate_passed_pawn_mask(Color::White, sq);
             PASSED_PAWN_MASKS[1][sq as usize] = generate_passed_pawn_mask(Color::Black, sq);
             OUTPOST_MASKS[0][sq as usize] = generate_outpost_mask(Color::White, sq);
@@ -325,17 +350,20 @@ fn evaluate_king(board: &Board, _pawn_entry: &PawnEntry) -> EvalScore {
         let mut attackers_count = 0;
 
         let enemy_knights = board.knights[them];
-        let mut kn = enemy_knights;
-        while kn != 0 {
-            let sq = pop_lsb(&mut kn);
-            if (get_knight_attacks(sq) & king_ring) != 0 {
-                attackers_count += 1;
-                attack_weight += ATTACK_WEIGHT_KNIGHT;
-            }
+        let knight_attackers = enemy_knights & unsafe { KING_ZONE_KNIGHT_ATTACKS[king_sq as usize] };
+        let count = count_bits(knight_attackers) as i32;
+        if count > 0 {
+            attackers_count += count;
+            attack_weight += count * ATTACK_WEIGHT_KNIGHT;
         }
 
-        let enemy_bishops = board.bishops[them];
-        let mut bi = enemy_bishops;
+        // Bishops: use precomputed ray mask as a fast pre-filter.
+        // Only bishops that sit on a ray from the king zone can possibly
+        // attack it. We still need per-piece sliding checks because of
+        // occupancy blocking, but this reduces the loop body count.
+        let bishop_ray_mask = unsafe { KING_ZONE_BISHOP_RAYS[king_sq as usize] };
+        let candidate_bishops = board.bishops[them] & bishop_ray_mask;
+        let mut bi = candidate_bishops;
         while bi != 0 {
             let sq = pop_lsb(&mut bi);
             if (get_bishop_attacks(sq, board.all_occupancy) & king_ring) != 0 {
@@ -344,8 +372,10 @@ fn evaluate_king(board: &Board, _pawn_entry: &PawnEntry) -> EvalScore {
             }
         }
 
-        let enemy_rooks = board.rooks[them];
-        let mut ro = enemy_rooks;
+        // Rooks: same pre-filter approach.
+        let rook_ray_mask = unsafe { KING_ZONE_ROOK_RAYS[king_sq as usize] };
+        let candidate_rooks = board.rooks[them] & rook_ray_mask;
+        let mut ro = candidate_rooks;
         while ro != 0 {
             let sq = pop_lsb(&mut ro);
             if (get_rook_attacks(sq, board.all_occupancy) & king_ring) != 0 {
@@ -354,8 +384,10 @@ fn evaluate_king(board: &Board, _pawn_entry: &PawnEntry) -> EvalScore {
             }
         }
 
-        let enemy_queens = board.queens[them];
-        let mut qu = enemy_queens;
+        // Queens: can attack on both diagonals and ranks/files.
+        let queen_ray_mask = bishop_ray_mask | rook_ray_mask;
+        let candidate_queens = board.queens[them] & queen_ray_mask;
+        let mut qu = candidate_queens;
         while qu != 0 {
             let sq = pop_lsb(&mut qu);
             let atk = get_bishop_attacks(sq, board.all_occupancy) | get_rook_attacks(sq, board.all_occupancy);

@@ -181,6 +181,11 @@ impl MovePicker {
                     self.stage = Stage::Quiets;
                 }
                 Stage::Quiets => {
+                    if self.skip_quiets {
+                        self.stage = Stage::BadCaptures;
+                        self.index = 0;
+                        continue;
+                    }
                     while self.index < self.moves.len() {
                         searcher.pick_move(self.moves.as_mut_slice(), &mut self.scores, self.index);
                         let m = self.moves.get(self.index);
