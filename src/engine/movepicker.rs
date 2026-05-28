@@ -10,6 +10,7 @@ enum Stage {
     GenerateCaptures,
     GoodCaptures,
     Killers,
+    Countermove,
     GenerateQuiets,
     Quiets,
     BadCaptures,
@@ -25,10 +26,15 @@ pub struct MovePicker {
     is_qsearch: bool,
     excluded_move: Option<Move>,
     in_check: bool,
+    pub skip_quiets: bool,
+    killers_to_search: Vec<Move>,
+    countermove_to_search: Option<Move>,
+    original_killers: [Option<Move>; 2],
+    original_countermove: Option<Move>,
 }
 impl MovePicker {
-    pub fn new(tt_move: Option<Move>, is_qsearch: bool, in_check: bool) -> Self {
-        Self {
+    pub fn new(tt_move: Option<Move>, is_qsearch: bool, in_check: bool, killers: [Option<Move>; 2], countermove: Option<Move>) -> Self {
+        let mut picker = Self {
             stage: Stage::TT,
             tt_move,
             moves: MoveList::new(),
@@ -38,7 +44,28 @@ impl MovePicker {
             is_qsearch,
             excluded_move: None,
             in_check,
+            skip_quiets: false,
+            killers_to_search: Vec::new(),
+            countermove_to_search: None,
+            original_killers: killers,
+            original_countermove: countermove,
+        };
+        if let Some(m) = killers[0] {
+            if Some(m) != tt_move {
+                picker.killers_to_search.push(m);
+            }
         }
+        if let Some(m) = killers[1] {
+            if Some(m) != tt_move && killers[0] != Some(m) {
+                picker.killers_to_search.push(m);
+            }
+        }
+        if let Some(m) = countermove {
+            if Some(m) != tt_move && killers[0] != Some(m) && killers[1] != Some(m) {
+                picker.countermove_to_search = Some(m);
+            }
+        }
+        picker
     }
 
     pub fn with_excluded(tt_move: Option<Move>, excluded: Option<Move>, in_check: bool) -> Self {
@@ -52,6 +79,11 @@ impl MovePicker {
             is_qsearch: false,
             excluded_move: excluded,
             in_check,
+            skip_quiets: false,
+            killers_to_search: Vec::new(),
+            countermove_to_search: None,
+            original_killers: [None; 2],
+            original_countermove: None,
         }
     }
 
@@ -62,12 +94,14 @@ impl MovePicker {
                     self.stage = Stage::GenerateCaptures;
                     if let Some(m) = self.tt_move {
                         if Some(m) == self.excluded_move { continue; }
-                        return Some(m);
+                        if board.is_pseudo_legal(m) {
+                            return Some(m);
+                        }
                     }
                 }
                 Stage::GenerateCaptures => {
                     self.moves = if self.in_check {
-                        movegen::generate_evasions(board) // If in check, generate all evasions
+                        movegen::generate_evasions(board)
                     } else {
                         movegen::generate_captures(board)
                     };
@@ -90,12 +124,11 @@ impl MovePicker {
                         if Some(m) == self.tt_move || Some(m) == self.excluded_move { continue; }
 
                         if self.in_check {
-                            return Some(m); // Evasions are just yielded in order
+                            return Some(m);
                         }
 
-                        // Use the score assigned by score_move to partition good/bad captures.
-                        // score_move returns negative values for SEE-negative captures.
-                        if score >= 0 {
+                        let margin = -score / 18;
+                        if board.see(m) >= margin {
                             return Some(m);
                         } else {
                             self.bad_captures.push(m);
@@ -103,19 +136,34 @@ impl MovePicker {
                     }
                     
                     if self.in_check || self.is_qsearch {
-                        return None; // Done if qsearch or evasions
+                        return None;
                     }
                     
                     self.stage = Stage::Killers;
-                    self.index = 0;
                 }
                 Stage::Killers => {
-                    // For simplicity, we skip killers stage and just generate quiets, 
-                    // then prioritize killers during the Quiets stage. 
-                    // This avoids complex pseudo-legality checks for killers.
+                    if let Some(m) = self.killers_to_search.pop() {
+                        if board.is_pseudo_legal(m) {
+                            return Some(m);
+                        }
+                        continue;
+                    }
+                    self.stage = Stage::Countermove;
+                }
+                Stage::Countermove => {
                     self.stage = Stage::GenerateQuiets;
+                    if let Some(m) = self.countermove_to_search {
+                        if board.is_pseudo_legal(m) {
+                            return Some(m);
+                        }
+                    }
                 }
                 Stage::GenerateQuiets => {
+                    if self.skip_quiets {
+                        self.stage = Stage::BadCaptures;
+                        self.index = 0;
+                        continue;
+                    }
                     self.moves = movegen::generate_quiets(board);
                     self.scores.clear();
                     for i in 0..self.moves.len() {
@@ -131,7 +179,7 @@ impl MovePicker {
                         searcher.pick_move(self.moves.as_mut_slice(), &mut self.scores, self.index);
                         let m = self.moves.get(self.index);
                         self.index += 1;
-                        if Some(m) == self.tt_move || Some(m) == self.excluded_move { continue; }
+                        if Some(m) == self.tt_move || Some(m) == self.excluded_move || Some(m) == self.original_killers[0] || Some(m) == self.original_killers[1] || Some(m) == self.original_countermove { continue; }
                         return Some(m);
                     }
                     self.stage = Stage::BadCaptures;

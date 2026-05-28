@@ -62,5 +62,19 @@ fn main() {
 
     // Default to UCI mode
     let mut uci = Uci::new();
+    
+    // Process arguments if any (e.g. "elo 10 4 baseline")
+    if args.len() > 1 {
+        let cmd = args[1..].join(" ");
+        let responses = uci.process_command(&cmd);
+        for r in responses {
+            println!("{}", r);
+        }
+        // If it was an elo test or something that should exit, return here
+        if args[1] == "elo" {
+            return;
+        }
+    }
+
     uci.loop_communication();
 }

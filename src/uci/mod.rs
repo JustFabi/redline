@@ -84,7 +84,13 @@ impl Uci {
             "elo" => {
                 let num_games = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
                 let depth = parts.get(2).and_then(|s| s.parse::<u32>().ok());
-                crate::engine::elo_test::run_elo_test(num_games, depth);
+                let base_techniques = parts.get(3).map(|&s| s).unwrap_or("");
+                let base_settings = if base_techniques.is_empty() {
+                    crate::engine::search::SearchSettings::baseline()
+                } else {
+                    crate::engine::search::SearchSettings::from_string(base_techniques)
+                };
+                crate::engine::elo_test::run_elo_test(num_games, depth, base_settings);
                 vec![]
             }
             _ => vec![],

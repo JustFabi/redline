@@ -423,6 +423,102 @@ impl Board {
         true
     }
 
+    pub fn is_pseudo_legal(&self, m: Move) -> bool {
+        let from = m.from();
+        let to = m.to();
+        let color = self.side_to_move;
+        
+        if from >= 64 || to >= 64 { return false; }
+        if self.colors[from as usize] != color { return false; }
+        if self.colors[to as usize] == color { return false; }
+
+        let target_pt = self.pieces[to as usize];
+        let is_capture_flag = (m.flags() & flags::CAPTURE) != 0;
+        let is_en_passant = m.flags() == flags::EN_PASSANT;
+
+        // Ensure capture flag matches the target square occupancy (or en passant)
+        if is_capture_flag && !is_en_passant && target_pt == PieceType::Empty {
+            return false;
+        }
+        if !is_capture_flag && target_pt != PieceType::Empty {
+            return false;
+        }
+
+        let pt = self.pieces[from as usize];
+        let occ = self.all_occupancy;
+        let bb_to = bit(to);
+
+        match pt {
+            PieceType::Pawn => {
+                let f = m.flags();
+                let dir: i16 = if color == Color::White { 8 } else { -8 };
+                let from_i16 = from as i16;
+                let to_i16 = to as i16;
+                let diff = to_i16 - from_i16;
+
+                let is_promotion_rank = if color == Color::White { to / 8 == 7 } else { to / 8 == 0 };
+                let is_promotion_flag = f >= 8 && f <= 15;
+                if is_promotion_rank != is_promotion_flag { return false; }
+
+                // Pushes
+                if diff == dir || diff == dir * 2 {
+                    if from % 8 != to % 8 { return false; } // Must be same file
+                    if target_pt != PieceType::Empty { return false; } // Target must be empty
+                    if f >= 12 && f <= 15 { return false; } // Cannot be a capture promotion flag
+                    if f == flags::CAPTURE || f == flags::EN_PASSANT { return false; }
+
+                    if diff == dir {
+                        return f == flags::QUIET || (f >= 8 && f <= 11);
+                    } else if diff == dir * 2 {
+                        let start_rank = if color == Color::White { 1 } else { 6 };
+                        if from / 8 != start_rank { return false; }
+                        if f != flags::DOUBLE_PAWN { return false; }
+                        let middle = (from_i16 + dir) as u8;
+                        return self.pieces[middle as usize] == PieceType::Empty;
+                    }
+                } 
+                // Captures
+                else {
+                    let attacks = crate::movegen::pawn::get_pawn_attacks(from, color);
+                    if (attacks & bb_to) == 0 { return false; }
+
+                    if f == flags::EN_PASSANT {
+                        return Some(to) == self.en_passant_square && target_pt == PieceType::Empty;
+                    }
+                    
+                    if target_pt == PieceType::Empty { return false; } // Checked above, but good for completeness
+                    return f == flags::CAPTURE || (f >= 12 && f <= 15);
+                }
+                false
+            }
+            PieceType::Knight | PieceType::Bishop | PieceType::Rook | PieceType::Queen => {
+                let f = m.flags();
+                if f != flags::QUIET && f != flags::CAPTURE { return false; }
+                match pt {
+                    PieceType::Knight => (crate::movegen::knight::get_knight_attacks(from) & bb_to) != 0,
+                    PieceType::Bishop => (crate::magic::get_bishop_attacks(from, occ) & bb_to) != 0,
+                    PieceType::Rook => (crate::magic::get_rook_attacks(from, occ) & bb_to) != 0,
+                    PieceType::Queen => ((crate::magic::get_bishop_attacks(from, occ) | crate::magic::get_rook_attacks(from, occ)) & bb_to) != 0,
+                    _ => false,
+                }
+            }
+            PieceType::King => {
+                let f = m.flags();
+                if f != flags::QUIET && f != flags::CAPTURE && f != flags::KING_CASTLE && f != flags::QUEEN_CASTLE { return false; }
+                if (crate::movegen::king::get_king_attacks(from) & bb_to) != 0 { return true; }
+                if f == flags::KING_CASTLE || f == flags::QUEEN_CASTLE {
+                    let mut moves = crate::movegen::move_list::MoveList::new();
+                    crate::movegen::king::generate_king_moves(self, &mut moves, crate::movegen::GenType::All);
+                    for i in 0..moves.len() {
+                        if moves.get(i) == m { return true; }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Optimized legality check that uses pre-calculated pin and checker masks.
     #[inline(always)]
     pub fn is_legal_fast(&self, m: Move, pinned: u64, checkers: u64) -> bool {
@@ -430,10 +526,6 @@ impl Board {
         let to = m.to();
         let flags = m.flags();
         let moving_color = self.side_to_move;
-
-        // 1. Basic sanity (optional, but good for safety)
-        if self.colors[from as usize] != moving_color { return false; }
-        if self.colors[to as usize] == moving_color { return false; }
 
         let pt = self.pieces[from as usize];
 
@@ -758,23 +850,25 @@ impl Board {
         }
         self.pieces[sq as usize] = PieceType::Empty;
         self.colors[sq as usize] = Color::None;
-        self.hash ^= ZOBRIST.hash_piece(color, pt, sq);
+        if pt != PieceType::Empty {
+            self.hash ^= ZOBRIST.hash_piece(color, pt, sq);
 
-        let p_idx = pt.idx();
-        let pst_sq = if color == Color::White { ((7 - (sq / 8)) * 8 + (sq % 8)) as usize } else { sq as usize };
-        let mg = MG_VALUE[p_idx] + MG_PST[p_idx][pst_sq];
-        let eg = EG_VALUE[p_idx] + EG_PST[p_idx][pst_sq];
+            let p_idx = pt.idx();
+            let pst_sq = if color == Color::White { ((7 - (sq / 8)) * 8 + (sq % 8)) as usize } else { sq as usize };
+            let mg = MG_VALUE[p_idx] + MG_PST[p_idx][pst_sq];
+            let eg = EG_VALUE[p_idx] + EG_PST[p_idx][pst_sq];
 
-        if color == Color::White {
-            self.mg_pst -= mg;
-            self.eg_pst -= eg;
-        } else {
-            self.mg_pst += mg;
-            self.eg_pst += eg;
-        }
+            if color == Color::White {
+                self.mg_pst -= mg;
+                self.eg_pst -= eg;
+            } else {
+                self.mg_pst += mg;
+                self.eg_pst += eg;
+            }
 
-        if pt == PieceType::Pawn {
-            self.pawn_hash ^= ZOBRIST.hash_piece(color, pt, sq);
+            if pt == PieceType::Pawn {
+                self.pawn_hash ^= ZOBRIST.hash_piece(color, pt, sq);
+            }
         }
 
         self.occupancy[c] &= mask;
@@ -796,23 +890,25 @@ impl Board {
         }
         self.pieces[sq as usize] = pt;
         self.colors[sq as usize] = color;
-        self.hash ^= ZOBRIST.hash_piece(color, pt, sq);
+        if pt != PieceType::Empty {
+            self.hash ^= ZOBRIST.hash_piece(color, pt, sq);
 
-        let p_idx = pt.idx();
-        let pst_sq = if color == Color::White { ((7 - (sq / 8)) * 8 + (sq % 8)) as usize } else { sq as usize };
-        let mg = MG_VALUE[p_idx] + MG_PST[p_idx][pst_sq];
-        let eg = EG_VALUE[p_idx] + EG_PST[p_idx][pst_sq];
+            let p_idx = pt.idx();
+            let pst_sq = if color == Color::White { ((7 - (sq / 8)) * 8 + (sq % 8)) as usize } else { sq as usize };
+            let mg = MG_VALUE[p_idx] + MG_PST[p_idx][pst_sq];
+            let eg = EG_VALUE[p_idx] + EG_PST[p_idx][pst_sq];
 
-        if color == Color::White {
-            self.mg_pst += mg;
-            self.eg_pst += eg;
-        } else {
-            self.mg_pst -= mg;
-            self.eg_pst -= eg;
-        }
+            if color == Color::White {
+                self.mg_pst += mg;
+                self.eg_pst += eg;
+            } else {
+                self.mg_pst -= mg;
+                self.eg_pst -= eg;
+            }
 
-        if pt == PieceType::Pawn {
-            self.pawn_hash ^= ZOBRIST.hash_piece(color, pt, sq);
+            if pt == PieceType::Pawn {
+                self.pawn_hash ^= ZOBRIST.hash_piece(color, pt, sq);
+            }
         }
 
         self.occupancy[c] |= bb;
@@ -917,18 +1013,19 @@ impl Board {
            state
        }
 
-       pub fn is_repetition(&self) -> bool {
-           if self.history.is_empty() { return false; }
-           // Check if current hash has appeared before in history
-           // Only need to check moves within the current halfmove clock range
-           let start = self.history.len().saturating_sub(self.halfmove_clock as usize);
-           for i in (start..self.history.len()).rev() {
-               if self.history[i] == self.hash {
-                   return true;
-               }
-           }
-           false
-       }
+    pub fn is_repetition(&self) -> bool {
+        if self.history.is_empty() { return false; }
+        let start = self.history.len().saturating_sub(self.halfmove_clock as usize);
+        // Only same-side positions can repeat. If current is Black to move, 
+        // history[len-2] is the most recent Black-to-move position.
+        if self.history.len() < 2 { return false; }
+        for i in (start..self.history.len() - 1).rev().step_by(2) {
+            if self.history[i] == self.hash {
+                return true;
+            }
+        }
+        false
+    }
 
     pub fn unmake_move(&mut self, m: Move, state: UndoState) {
         self.castling_rights = state.castling_rights;
@@ -1148,6 +1245,22 @@ impl Board {
         let mut attacker_pt = self.pieces[from as usize];
         gain[d] = self.see_value(self.pieces[to as usize]);
         
+        if m.flags() == flags::EN_PASSANT {
+            gain[d] = self.see_value(PieceType::Pawn);
+        }
+
+        if (m.flags() & 0x8) != 0 {
+            let promo_pt = match m.flags() {
+                flags::PROMOTE_QUEEN | flags::PROMOTE_QUEEN_CAPTURE => PieceType::Queen,
+                flags::PROMOTE_ROOK | flags::PROMOTE_ROOK_CAPTURE => PieceType::Rook,
+                flags::PROMOTE_BISHOP | flags::PROMOTE_BISHOP_CAPTURE => PieceType::Bishop,
+                flags::PROMOTE_KNIGHT | flags::PROMOTE_KNIGHT_CAPTURE => PieceType::Knight,
+                _ => PieceType::Queen,
+            };
+            gain[d] += self.see_value(promo_pt) - self.see_value(PieceType::Pawn);
+            attacker_pt = promo_pt;
+        }
+        
         let mut occ = self.all_occupancy;
         let mut attackers = self.all_attackers_to(to, occ);
         
@@ -1172,10 +1285,11 @@ impl Board {
             let attacker_sq = self.least_valuable_attacker(attackers, side);
             if attacker_sq == 64 { break; }
             
-            attacker_pt = self.pieces[attacker_sq as usize];
             gain[d] = self.see_value(attacker_pt) - gain[d - 1];
             
             if gain[d].max(gain[d-1]) < 0 { break; } // Optimization
+            
+            attacker_pt = self.pieces[attacker_sq as usize];
             
             occ &= !bit(attacker_sq);
             attackers &= !bit(attacker_sq);

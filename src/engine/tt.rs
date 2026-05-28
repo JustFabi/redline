@@ -53,32 +53,36 @@ impl TranspositionTable {
             data |= (m.raw() as u64) << 48;
         }
 
-        let key1 = self.table[idx].load(Ordering::Relaxed);
-        let key2 = self.table[idx + 2].load(Ordering::Relaxed);
+        let key_xor1 = self.table[idx].load(Ordering::Relaxed);
+        let data1 = self.table[idx + 1].load(Ordering::Relaxed);
+        let key1 = key_xor1 ^ data1;
+
+        let key_xor2 = self.table[idx + 2].load(Ordering::Relaxed);
+        let data2 = self.table[idx + 3].load(Ordering::Relaxed);
+        let key2 = key_xor2 ^ data2;
 
         // Always update if same key
         if key1 == key {
             self.table[idx + 1].store(data, Ordering::Relaxed);
-            self.table[idx].store(key, Ordering::Release);
+            self.table[idx].store(key ^ data, Ordering::Release);
             return;
         }
         if key2 == key {
             self.table[idx + 3].store(data, Ordering::Relaxed);
-            self.table[idx + 2].store(key, Ordering::Release);
+            self.table[idx + 2].store(key ^ data, Ordering::Release);
             return;
         }
 
-        // Slot 1 is Always-Replace
-        self.table[idx + 1].store(data, Ordering::Relaxed);
-        self.table[idx].store(key, Ordering::Release);
-
         // Slot 2 is Depth-Preferred
-        let existing_data2 = self.table[idx + 3].load(Ordering::Relaxed);
-        let existing_depth2 = (existing_data2 & 0xFF) as u8;
+        let existing_depth2 = (data2 & 0xFF) as u8;
         
         if depth >= existing_depth2 {
             self.table[idx + 3].store(data, Ordering::Relaxed);
-            self.table[idx + 2].store(key, Ordering::Release);
+            self.table[idx + 2].store(key ^ data, Ordering::Release);
+        } else {
+            // Slot 1 is Always-Replace
+            self.table[idx + 1].store(data, Ordering::Relaxed);
+            self.table[idx].store(key ^ data, Ordering::Release);
         }
     }
 
@@ -87,10 +91,16 @@ impl TranspositionTable {
         
         let mut found_data = None;
 
-        if self.table[idx].load(Ordering::Acquire) == key {
-            found_data = Some(self.table[idx + 1].load(Ordering::Relaxed));
-        } else if self.table[idx + 2].load(Ordering::Acquire) == key {
-            found_data = Some(self.table[idx + 3].load(Ordering::Relaxed));
+        let key_xor1 = self.table[idx].load(Ordering::Acquire);
+        let data1 = self.table[idx + 1].load(Ordering::Relaxed);
+        if key_xor1 ^ data1 == key {
+            found_data = Some(data1);
+        } else {
+            let key_xor2 = self.table[idx + 2].load(Ordering::Acquire);
+            let data2 = self.table[idx + 3].load(Ordering::Relaxed);
+            if key_xor2 ^ data2 == key {
+                found_data = Some(data2);
+            }
         }
 
         if let Some(data) = found_data {
@@ -124,7 +134,7 @@ impl TranspositionTable {
         let sample_size = (self.mask + 1).min(1000);
         if sample_size == 0 { return 0; }
         for i in 0..sample_size {
-            // Count bucket as occupied if either slot is used
+            // Count bucket as occupied if either slot is used (non-zero key_xor)
             if self.table[i * 4].load(Ordering::Relaxed) != 0 || self.table[i * 4 + 2].load(Ordering::Relaxed) != 0 {
                 occupied += 1;
             }
