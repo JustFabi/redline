@@ -320,13 +320,13 @@ impl Searcher {
 
                 if score <= alpha {
                     alpha = (alpha - delta).max(-INFINITY);
-                    delta *= 2;
+                    delta += delta / 2 + 50;
                     if alpha <= -MATE_VALUE + 1000 { alpha = -INFINITY; }
                     best_score = score;
                     if m.is_some() { best_move = m; }
                 } else if score >= beta {
                     beta = (beta + delta).min(INFINITY);
-                    delta *= 2;
+                    delta += delta / 2 + 50;
                     best_score = score;
                     if m.is_some() { best_move = m; }
                     if beta >= MATE_VALUE - 1000 { beta = INFINITY; }
@@ -406,15 +406,12 @@ impl Searcher {
         if in_check && ply < 16 { depth += 1; }
 
         let mut tt_move = None;
-        let mut tt_depth = 0;
-        let mut tt_bound = NodeType::Alpha;
-        let mut tt_value = VALUE_NONE;
 
         if let Some(entry) = self.tt.probe(board.hash) {
             tt_move = entry.best_move;
-            tt_value = self.value_from_tt(entry.score, ply);
-            tt_depth = entry.depth;
-            tt_bound = entry.node_type;
+            let tt_value = self.value_from_tt(entry.score, ply);
+            let tt_depth = entry.depth;
+            let tt_bound = entry.node_type;
 
             if !is_pv_node && excluded_move.is_none() && tt_depth >= depth as u8 && tt_value != VALUE_NONE {
                 match tt_bound {
@@ -488,6 +485,7 @@ impl Searcher {
         };
 
         let futility_move_count = (3 + depth * depth) / (2 - if improving { 1 } else { 0 });
+        let us_idx = board.side_to_move.idx();
 
         while let Some(m) = picker.next(self, board, ply) {
             if !board.is_legal_fast(m, pinned, checkers) { continue; }
@@ -500,7 +498,7 @@ impl Searcher {
             let is_first_move = legal_moves == 1;
 
             if self.settings.history_pruning && !is_pv_node && depth <= 8 && legal_moves > 1 && is_quiet {
-                let hist = self.history[board.side_to_move.idx()][m.from() as usize][m.to() as usize];
+                let hist = self.history[us_idx][m.from() as usize][m.to() as usize];
                 if hist < -4000 * depth as i32 { continue; }
             }
 
@@ -511,7 +509,7 @@ impl Searcher {
 
             if self.settings.see_pruning && !is_pv_node && depth <= 8 && legal_moves > 1 {
                 let margin = if is_quiet { -25 * depth as i32 * depth as i32 } else {
-                    let hist = self.capture_history[board.side_to_move.idx()][(board.pieces[m.from() as usize] as usize).min(5)][m.to() as usize][(board.pieces[m.to() as usize] as usize).min(5)];
+                    let hist = self.capture_history[us_idx][(board.pieces[m.from() as usize] as usize).min(5)][m.to() as usize][(board.pieces[m.to() as usize] as usize).min(5)];
                     -166 * depth as i32 - hist / 29
                 };
                 if board.see(m) < margin { continue; }
@@ -523,8 +521,7 @@ impl Searcher {
             }
 
             // Bug 5 fix: removed redundant is_legal_fast (already checked above)
-            // Bug 1 fix: save side_to_move BEFORE make_move flips it
-            let us_idx = board.side_to_move.idx();
+            // Bug 1 fix: save side_to_move BEFORE make_move flips it (hoisted to us_idx)
             let state = board.make_move(m);
             let mut score;
 

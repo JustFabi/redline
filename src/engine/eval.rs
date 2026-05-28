@@ -1,8 +1,7 @@
 use crate::board::board::Board;
-use crate::board::piece::{Color, PieceType};
+use crate::board::piece::Color;
 use crate::board::bitboard::{count_bits, bit, pop_lsb};
 use crate::movegen::knight::get_knight_attacks;
-use crate::movegen::king::get_king_attacks;
 use crate::magic::{get_bishop_attacks, get_rook_attacks};
 use std::cmp;
 
@@ -310,7 +309,7 @@ fn evaluate_pawns(board: &Board, mut pawn_table: Option<&mut PawnTable>) -> Pawn
     entry
 }
 
-fn evaluate_king(board: &Board, pawn_entry: &PawnEntry) -> EvalScore {
+fn evaluate_king(board: &Board, _pawn_entry: &PawnEntry) -> EvalScore {
     let mut score = EvalScore::default();
 
     for color in [Color::White, Color::Black] {
@@ -589,20 +588,8 @@ fn evaluate_scale(board: &Board, mut score: i32, phase: i32) -> i32 {
 }
 
 fn generate_king_zone(king_sq: u8) -> u64 {
-    let mut zone = 0u64;
     let rank = (king_sq / 8) as i32;
     let file = (king_sq % 8) as i32;
-    for dr in -2..=2 {
-        for df in -2..=2 {
-            let r = rank + dr;
-            let f = file + df;
-            if r >= 0 && r < 8 && f >= 0 && f < 8 {
-                if dr.abs() <= 1 && df.abs() <= 1 {
-                    zone |= bit((r * 8 + f) as u8);
-                }
-            }
-        }
-    }
     let mut clean_zone = 0;
     for dr in -1..=1 {
         for df in -1..=1 {

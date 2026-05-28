@@ -20,44 +20,49 @@ pub struct MovePicker {
     stage: Stage,
     tt_move: Option<Move>,
     moves: MoveList,
-    scores: Vec<i32>,
+    scores: [i32; 256],
     bad_captures: MoveList,
     index: usize,
     is_qsearch: bool,
     excluded_move: Option<Move>,
     in_check: bool,
     pub skip_quiets: bool,
-    killers_to_search: Vec<Move>,
+    killers_to_search: [Move; 2],
+    killers_count: usize,
     countermove_to_search: Option<Move>,
     original_killers: [Option<Move>; 2],
     original_countermove: Option<Move>,
 }
 impl MovePicker {
+    #[inline(always)]
     pub fn new(tt_move: Option<Move>, is_qsearch: bool, in_check: bool, killers: [Option<Move>; 2], countermove: Option<Move>) -> Self {
         let mut picker = Self {
             stage: Stage::TT,
             tt_move,
             moves: MoveList::new(),
-            scores: Vec::new(),
+            scores: [0; 256],
             bad_captures: MoveList::new(),
             index: 0,
             is_qsearch,
             excluded_move: None,
             in_check,
             skip_quiets: false,
-            killers_to_search: Vec::new(),
+            killers_to_search: [Move::from_raw(0); 2],
+            killers_count: 0,
             countermove_to_search: None,
             original_killers: killers,
             original_countermove: countermove,
         };
         if let Some(m) = killers[0] {
             if Some(m) != tt_move {
-                picker.killers_to_search.push(m);
+                picker.killers_to_search[picker.killers_count] = m;
+                picker.killers_count += 1;
             }
         }
         if let Some(m) = killers[1] {
             if Some(m) != tt_move && killers[0] != Some(m) {
-                picker.killers_to_search.push(m);
+                picker.killers_to_search[picker.killers_count] = m;
+                picker.killers_count += 1;
             }
         }
         if let Some(m) = countermove {
@@ -68,25 +73,28 @@ impl MovePicker {
         picker
     }
 
+    #[inline(always)]
     pub fn with_excluded(tt_move: Option<Move>, excluded: Option<Move>, in_check: bool) -> Self {
         Self {
             stage: Stage::TT,
             tt_move,
             moves: MoveList::new(),
-            scores: Vec::new(),
+            scores: [0; 256],
             bad_captures: MoveList::new(),
             index: 0,
             is_qsearch: false,
             excluded_move: excluded,
             in_check,
             skip_quiets: false,
-            killers_to_search: Vec::new(),
+            killers_to_search: [Move::from_raw(0); 2],
+            killers_count: 0,
             countermove_to_search: None,
             original_killers: [None; 2],
             original_countermove: None,
         }
     }
 
+    #[inline(always)]
     pub fn next(&mut self, searcher: &Searcher, board: &Board, ply: u32) -> Option<Move> {
         loop {
             match self.stage {
@@ -106,11 +114,10 @@ impl MovePicker {
                         movegen::generate_captures(board)
                     };
                     
-                    self.scores.clear();
                     for i in 0..self.moves.len() {
                         let m = self.moves.get(i);
                         let score = searcher.score_move(m, board, self.tt_move, ply, self.is_qsearch);
-                        self.scores.push(score);
+                        self.scores[i] = score;
                     }
                     self.index = 0;
                     self.stage = Stage::GoodCaptures;
@@ -142,7 +149,9 @@ impl MovePicker {
                     self.stage = Stage::Killers;
                 }
                 Stage::Killers => {
-                    if let Some(m) = self.killers_to_search.pop() {
+                    if self.killers_count > 0 {
+                        self.killers_count -= 1;
+                        let m = self.killers_to_search[self.killers_count];
                         if board.is_pseudo_legal(m) {
                             return Some(m);
                         }
@@ -165,11 +174,10 @@ impl MovePicker {
                         continue;
                     }
                     self.moves = movegen::generate_quiets(board);
-                    self.scores.clear();
                     for i in 0..self.moves.len() {
                         let m = self.moves.get(i);
                         let score = searcher.score_move(m, board, self.tt_move, ply, self.is_qsearch);
-                        self.scores.push(score);
+                        self.scores[i] = score;
                     }
                     self.index = 0;
                     self.stage = Stage::Quiets;

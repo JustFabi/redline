@@ -36,6 +36,7 @@ impl TranspositionTable {
         Self { table, mask: bucket_count - 1 }
     }
 
+    #[inline(always)]
     pub fn store(&self, key: u64, depth: u8, score: i32, node_type: NodeType, best_move: Option<Move>, age: u8) {
         let idx = (key as usize & self.mask) * 4;
         
@@ -86,6 +87,7 @@ impl TranspositionTable {
         }
     }
 
+    #[inline(always)]
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
         let idx = (key as usize & self.mask) * 4;
         
