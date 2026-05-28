@@ -358,7 +358,8 @@ impl Searcher {
                 println!("info depth {} seldepth {} score {} nodes {} nps {} time {} pv {}", d, self.seldepth, self.format_score(best_score), total_nodes, nps, elapsed, pv_str);
             }
             
-            if best_score.abs() > MATE_VALUE - 1000 { break; }
+            // Removed early mate exit: keep searching to find shorter mates or refute bad PVs
+            // if best_score.abs() > MATE_VALUE - 1000 { break; }
 
             if let Some(soft) = self.soft_time_limit {
                 let elapsed_dur = self.start_time.elapsed();
