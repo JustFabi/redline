@@ -143,4 +143,18 @@ impl TranspositionTable {
         }
         (occupied * 1000) / sample_size
     }
+
+    #[inline(always)]
+    pub fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let idx = (key as usize & self.mask) * 4;
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    self.table.as_ptr().add(idx) as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0
+                );
+            }
+        }
+    }
 }

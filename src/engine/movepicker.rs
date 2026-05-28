@@ -126,7 +126,6 @@ impl MovePicker {
                     while self.index < self.moves.len() {
                         searcher.pick_move(self.moves.as_mut_slice(), &mut self.scores, self.index);
                         let m = self.moves.get(self.index);
-                        let score = self.scores[self.index];
                         self.index += 1;
                         if Some(m) == self.tt_move || Some(m) == self.excluded_move { continue; }
 
@@ -134,8 +133,7 @@ impl MovePicker {
                             return Some(m);
                         }
 
-                        let margin = -score / 18;
-                        if board.see(m) >= margin {
+                        if board.see(m) >= 0 {
                             return Some(m);
                         } else {
                             self.bad_captures.push(m);

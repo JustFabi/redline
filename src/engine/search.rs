@@ -19,12 +19,18 @@ type ContHistTable = [[[[[i32; 64]; 7]; 64]; 7]; CONT_HIST_LEVELS];
 
 const SEE_PIECE_VALUES: [i32; 7] = [100, 325, 335, 500, 975, 0, 0];
 
-fn build_lmr_table() -> [i32; 256] {
-    let mut table = [0i32; 256];
-    for i in 1..256 {
-        table[i] = (21.4609375 * (i as f64).ln()) as i32;
-    }
-    table
+lazy_static::lazy_static! {
+    static ref LMR_TABLE: [[i32; 256]; 64] = {
+        let mut table = [[0; 256]; 64];
+        for d in 1..64 {
+            for m in 1..256 {
+                let v_d = (21.4609375 * (d as f64).ln()) as i32;
+                let v_m = (21.4609375 * (m as f64).ln()) as i32;
+                table[d][m] = v_d * v_m;
+            }
+        }
+        table
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -153,7 +159,6 @@ pub struct Searcher {
     pv_table: Box<[[Option<Move>; MAX_PLY]; MAX_PLY]>,
     pv_length: Box<[usize; MAX_PLY]>,
     pub pawn_table: PawnTable,
-    pub lmr_table: [i32; 256],
     pub low_ply_history: Box<[[[i32; 64]; 64]; 2]>,
     pub root_delta: i32,
     pub last_info_time: Instant,
@@ -211,7 +216,6 @@ impl Searcher {
             },
             pv_length: Box::new([0; MAX_PLY]),
             pawn_table: PawnTable::new(8192),
-            lmr_table: build_lmr_table(),
             low_ply_history: unsafe {
                 let layout = std::alloc::Layout::new::<[[[i32; 64]; 64]; 2]>();
                 let ptr = std::alloc::alloc_zeroed(layout) as *mut [[[i32; 64]; 64]; 2];
@@ -249,9 +253,9 @@ impl Searcher {
 
     fn reduction(&self, improving: bool, depth: u32, move_count: i32, delta: i32, root_delta: i32) -> i32 {
         if depth < 1 || move_count < 1 { return 0; }
-        let d = depth.min(255) as usize;
+        let d = depth.min(63) as usize;
         let m = (move_count as usize).min(255);
-        let mut r = self.lmr_table[d] * self.lmr_table[m];
+        let mut r = LMR_TABLE[d][m];
         if !improving { r += r * 238 / 512; }
         r -= delta * 608 / root_delta.max(1);
         r + 1182
@@ -386,6 +390,7 @@ impl Searcher {
     }
 
     fn negamax(&mut self, board: &mut Board, mut depth: u32, mut alpha: i32, mut beta: i32, ply: u32, excluded_move: Option<Move>) -> (Option<Move>, i32) {
+        self.tt.prefetch(board.hash);
         if (ply as usize) < MAX_PLY { self.pv_length[ply as usize] = 0; }
         let is_pv_node = beta - alpha > 1;
 
@@ -525,13 +530,9 @@ impl Searcher {
             let state = board.make_move(m);
             let mut score;
 
-            // Bug 2 fix: removed !is_pv_node — LMR now applies at PV nodes too (like Stockfish)
             if self.settings.lmr && !is_first_move && depth >= 3 && is_quiet && Some(m) != tt_move {
                 let mut r = self.reduction(improving, depth, legal_moves as i32, beta - alpha, self.root_delta);
-                
-                // Reduce reduction for PV nodes to avoid missing tactics
                 if is_pv_node { r -= 1024; }
-                // Bug 1 fix: use us_idx (saved before make_move) instead of board.side_to_move
                 let hist = self.history[us_idx][m.from() as usize][m.to() as usize];
                 r -= hist * 850 / 8192;
                 
@@ -540,11 +541,15 @@ impl Searcher {
                 score = -score;
 
                 if score > alpha && d < depth - 1 {
-                    (_, score) = self.negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1, None);
+                    let new_depth = depth - 1 + extension;
+                    (_, score) = self.negamax(board, new_depth, -alpha - 1, -alpha, ply + 1, None);
                     score = -score;
                 }
+            } else if !is_first_move {
+                (_, score) = self.negamax(board, depth - 1 + extension, -alpha - 1, -alpha, ply + 1, None);
+                score = -score;
             } else {
-                (_, score) = self.negamax(board, depth - 1 + extension, if is_first_move { -beta } else { -alpha - 1 }, -alpha, ply + 1, None);
+                (_, score) = self.negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1, None);
                 score = -score;
             }
 
@@ -579,6 +584,7 @@ impl Searcher {
     }
 
     fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u32) -> i32 {
+        self.tt.prefetch(board.hash);
         if (ply as usize) < MAX_PLY { self.pv_length[ply as usize] = 0; }
         if (self.nodes.load(Ordering::Relaxed) & 2047) == 0 { self.check_time(); }
         if ply >= MAX_PLY as u32 - 1 { return evaluate(board, Some(&mut self.pawn_table)); }
@@ -723,7 +729,7 @@ impl Searcher {
         scores.swap(start, best_idx);
     }
 
-    pub fn score_move(&self, m: Move, board: &Board, tt_move: Option<Move>, ply: u32, is_qsearch: bool) -> i32 {
+    pub fn score_move(&self, m: Move, board: &Board, tt_move: Option<Move>, ply: u32, _is_qsearch: bool) -> i32 {
         if Some(m) == tt_move { return 1_000_000; }
         let is_capture = (m.flags() & flags::CAPTURE) != 0;
         let is_promotion = (m.flags() & 0x8) != 0;
@@ -736,10 +742,6 @@ impl Searcher {
             let attacker = board.pieces[m.from() as usize];
             let mut score = 50_000 + 10 * self.val(victim) - self.val(attacker);
             score += self.capture_history[board.side_to_move.idx()][(attacker as usize).min(5)][m.to() as usize][(victim as usize).min(5)] / 128;
-            let see_val = board.see(m);
-            if is_qsearch {
-                if self.val(victim) <= self.val(attacker) && see_val < 0 { return -50_000 + see_val; }
-            } else if see_val < 0 { return -5_000 + see_val; }
             return score;
         }
 
