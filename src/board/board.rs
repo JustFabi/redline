@@ -267,162 +267,82 @@ impl Board {
     /// - Early exit for most common cases
     /// - Reuses `is_in_check` and `pins_and_checkers`
     /// - Special fast paths for castling, en passant, and pinned pieces
+    /// Standard legality check. Used when pinned/checkers aren't pre-calculated.
     #[inline(always)]
     pub fn is_legal(&self, m: Move) -> bool {
+        let (pinned, checkers) = self.pins_and_checkers(self.side_to_move);
+        self.is_legal_fast(m, pinned, checkers)
+    }
+
+    /// Optimized legality check that uses pre-calculated pin and checker masks.
+    /// This assumes the move is pseudo-legal (and if in check, it evades it!).
+    #[inline(always)]
+    pub fn is_legal_fast(&self, m: Move, pinned: u64, checkers: u64) -> bool {
         let from = m.from();
         let to = m.to();
         let flags = m.flags();
-
-        // 1. Basic sanity: from square must have our piece
         let moving_color = self.side_to_move;
-        if self.colors[from as usize] != moving_color {
-            return false;
+        let pt = self.pieces[from as usize];
+
+        // 1. Castling moves
+        if flags == flags::KING_CASTLE || flags == flags::QUEEN_CASTLE {
+            if checkers != 0 { return false; }
+            let step: i8 = if to > from { 1 } else { -1 };
+            let mut s = (from as i8 + step) as u8;
+            while s != to {
+                if self.is_square_attacked(s, moving_color.opposite()) { return false; }
+                s = (s as i8 + step) as u8;
+            }
+            if self.is_square_attacked(to, moving_color.opposite()) { return false; }
+            return true;
         }
 
-        // 2. Cannot capture own piece
-        let color = self.colors[to as usize];
-        if color != Color::None {
-            if color == moving_color {
+        // 2. King moves
+        if pt == PieceType::King {
+            let occ = self.all_occupancy ^ bit(from);
+            return !self.is_square_attacked_with_occ(to, moving_color.opposite(), occ);
+        }
+
+        // 3. Evasions (when in check)
+        if checkers != 0 {
+            if crate::board::bitboard::count_bits(checkers) > 1 { return false; }
+            let checker_sq = checkers.trailing_zeros() as u8;
+            let block_mask = bit(checker_sq) | self.between(checker_sq, self.kings[moving_color.idx()].trailing_zeros() as u8);
+            
+            if flags == flags::EN_PASSANT {
+                let cap_sq = if moving_color == Color::White { to - 8 } else { to + 8 };
+                if cap_sq != checker_sq && (bit(to) & block_mask) == 0 {
+                    return false;
+                }
+            } else if (bit(to) & block_mask) == 0 {
                 return false;
             }
         }
 
-        let pt = self.pieces[from as usize];
+        // 4. En Passant captures are a tricky special case.
+        if flags == flags::EN_PASSANT {
+            let king_sq = self.kings[moving_color.idx()].trailing_zeros() as u8;
+            let cap_sq = if moving_color == Color::White { to - 8 } else { to + 8 };
+            let occ = self.all_occupancy ^ bit(from) ^ bit(cap_sq) | bit(to);
+            let enemy = moving_color.opposite().idx();
 
-        // 3. Special move handling (castling, en passant, promotion)
-        match flags {
-            // ====================== CASTLING ======================
-            flags::KING_CASTLE | flags::QUEEN_CASTLE => {
-                return self.is_legal_castling(m);
-            }
-
-            // ====================== EN PASSANT ======================
-            flags::EN_PASSANT => {
-                return self.is_legal_en_passant(m);
-            }
-
-            _ => {}
+            let rooks_queens = self.rooks[enemy] | self.queens[enemy];
+            if (crate::magic::get_rook_attacks(king_sq, occ) & rooks_queens) != 0 { return false; }
+            let bishops_queens = self.bishops[enemy] | self.queens[enemy];
+            if (crate::magic::get_bishop_attacks(king_sq, occ) & bishops_queens) != 0 { return false; }
+            return true;
         }
 
-        // 4. Normal moves (including promotions and captures)
-
-        // Fast path: if not in check and piece is not pinned → almost always legal
-        if !self.is_in_check(moving_color) {
-            let (pinned, _) = self.pins_and_checkers(moving_color);
-
-            if pt == PieceType::King {
-                let occ = self.all_occupancy ^ bit(from);
-                return !self.is_square_attacked_with_occ(to, moving_color.opposite(), occ);
-            }
-
-            // If the piece is not pinned, the move is legal (we already checked basic validity)
-            if (pinned & bit(from)) == 0 {
-                return true;
-            }
-
-            // Piece is pinned → must stay on the pin line
-            return self.is_pinned_move_legal(from, to, pinned);
+        // 5. Pinned pieces must stay on the pin ray
+        if (pinned & bit(from)) == 0 {
+            return true;
         }
-
-        // 5. We are in check → more expensive validation
-        self.is_legal_when_in_check(m)
+        
+        let king_sq = self.kings[moving_color.idx()].trailing_zeros() as u8;
+        crate::magic::aligned(from, to, king_sq)
     }
 
-    // ===================================================================
-    // Helper: Castling legality
-    // ===================================================================
-    #[inline(never)]
-    fn is_legal_castling(&self, m: Move) -> bool {
-        let side = self.side_to_move;
-        let king_from = if side == Color::White { 4 } else { 60 };
-        let flags = m.flags();
-
-        // King must be on starting square and not in check
-        if self.kings[side.idx()] != bit(king_from) || self.is_in_check(side) {
-            return false;
-        }
-
-        let (king_to, _rook_from, _rook_to) = if flags == flags::KING_CASTLE {
-            if side == Color::White { (6, 7, 5) } else { (62, 63, 61) }
-        } else {
-            if side == Color::White { (2, 0, 3) } else { (58, 56, 59) }
-        };
-
-        // Check castling rights
-        let required_right = if flags == flags::KING_CASTLE {
-            if side == Color::White { castling::WHITE_KING } else { castling::BLACK_KING }
-        } else {
-            if side == Color::White { castling::WHITE_QUEEN } else { castling::BLACK_QUEEN }
-        };
-        if (self.castling_rights & required_right) == 0 {
-            return false;
-        }
-
-        // Squares between king and rook must be empty
-        let between_mask = if flags == flags::KING_CASTLE {
-            if side == Color::White { bit(5) | bit(6) } else { bit(61) | bit(62) }
-        } else {
-            if side == Color::White { bit(1) | bit(2) | bit(3) } else { bit(57) | bit(58) | bit(59) }
-        };
-        if (self.all_occupancy & between_mask) != 0 {
-            return false;
-        }
-
-        // King cannot pass through or land on attacked squares
-        let passing_sq = if flags == flags::KING_CASTLE {
-            if side == Color::White { 5 } else { 61 }
-        } else {
-            if side == Color::White { 3 } else { 59 }
-        };
-
-        !self.is_square_attacked(king_from, side.opposite()) && // redundant but cheap
-        !self.is_square_attacked(passing_sq, side.opposite()) &&
-        !self.is_square_attacked(king_to, side.opposite())
-    }
-
-    // ===================================================================
-    // Helper: En passant legality
-    // ===================================================================
-    #[inline(never)]
-    fn is_legal_en_passant(&self, m: Move) -> bool {
-        let side = self.side_to_move;
-        let to = m.to();
-        let from = m.from();
-
-        if self.en_passant_square != Some(to) {
-            return false;
-        }
-
-        let cap_sq = if side == Color::White { to - 8 } else { to + 8 };
-        if self.pieces[cap_sq as usize] != PieceType::Pawn {
-            return false;
-        }
-
-        let king_sq = self.kings[side.idx()].trailing_zeros() as u8;
-        let occ = self.all_occupancy ^ bit(from) ^ bit(cap_sq) | bit(to);
-        let enemy = side.opposite();
-        let e_idx = enemy.idx();
-        
-        // 1. Sliding attacks with new occupancy
-        let rooks_queens = self.rooks[e_idx] | self.queens[e_idx];
-        let bishops_queens = self.bishops[e_idx] | self.queens[e_idx];
-        
-        if (crate::magic::get_rook_attacks(king_sq, occ) & rooks_queens) != 0 { return false; }
-        if (crate::magic::get_bishop_attacks(king_sq, occ) & bishops_queens) != 0 { return false; }
-        
-        // 2. Knight attacks
-        if (crate::movegen::knight::get_knight_attacks(king_sq) & self.knights[e_idx]) != 0 { return false; }
-        
-        // 3. Pawn attacks (enemy pawns EXCEPT the captured one)
-        let enemy_pawns = self.pawns[e_idx] & !bit(cap_sq);
-        if (crate::movegen::pawn::get_pawn_attacks(king_sq, side) & enemy_pawns) != 0 { return false; }
-        
-        // 4. King attacks
-        if (crate::movegen::king::get_king_attacks(king_sq) & self.kings[e_idx]) != 0 { return false; }
-        
-        true
-    }
-
+    /// Tests if a move is pseudo-legal. Used for TT moves and Killers.
     pub fn is_pseudo_legal(&self, m: Move) -> bool {
         let from = m.from();
         let to = m.to();
@@ -447,6 +367,31 @@ impl Board {
         let pt = self.pieces[from as usize];
         let occ = self.all_occupancy;
         let bb_to = bit(to);
+
+        // Filter out moves that don't block check (if in check)
+        let (_, checkers) = self.pins_and_checkers(color);
+        if checkers != 0 {
+            if pt != PieceType::King {
+                // Double check -> king move required
+                if count_bits(checkers) > 1 { return false; }
+                
+                // Must block or capture checker
+                let checker_sq = checkers.trailing_zeros() as u8;
+                let block_mask = bit(checker_sq) | self.between(checker_sq, self.kings[color.idx()].trailing_zeros() as u8);
+                
+                if m.flags() == flags::EN_PASSANT {
+                    let cap_sq = if color == Color::White { to - 8 } else { to + 8 };
+                    if cap_sq != checker_sq && (bit(to) & block_mask) == 0 { return false; }
+                } else if (bit(to) & block_mask) == 0 {
+                    return false;
+                }
+            } else {
+                let test_occ = occ ^ bit(from);
+                if self.is_square_attacked_with_occ(to, color.opposite(), test_occ) {
+                    return false;
+                }
+            }
+        }
 
         match pt {
             PieceType::Pawn => {
@@ -507,150 +452,24 @@ impl Board {
                 if f != flags::QUIET && f != flags::CAPTURE && f != flags::KING_CASTLE && f != flags::QUEEN_CASTLE { return false; }
                 if (crate::movegen::king::get_king_attacks(from) & bb_to) != 0 { return true; }
                 if f == flags::KING_CASTLE || f == flags::QUEEN_CASTLE {
-                    let mut moves = crate::movegen::move_list::MoveList::new();
-                    crate::movegen::king::generate_king_moves(self, &mut moves, crate::movegen::GenType::All);
-                    for i in 0..moves.len() {
-                        if moves.get(i) == m { return true; }
+                    // Check if rights exist
+                    if f == flags::KING_CASTLE {
+                        let required_right = if color == Color::White { castling::WHITE_KING } else { castling::BLACK_KING };
+                        if (self.castling_rights & required_right) == 0 { return false; }
+                        let between_mask = if color == Color::White { bit(5) | bit(6) } else { bit(61) | bit(62) };
+                        if (self.all_occupancy & between_mask) != 0 { return false; }
+                    } else {
+                        let required_right = if color == Color::White { castling::WHITE_QUEEN } else { castling::BLACK_QUEEN };
+                        if (self.castling_rights & required_right) == 0 { return false; }
+                        let between_mask = if color == Color::White { bit(1) | bit(2) | bit(3) } else { bit(57) | bit(58) | bit(59) };
+                        if (self.all_occupancy & between_mask) != 0 { return false; }
                     }
+                    return true;
                 }
                 false
             }
             _ => false,
         }
-    }
-
-    /// Optimized legality check that uses pre-calculated pin and checker masks.
-    #[inline(always)]
-    pub fn is_legal_fast(&self, m: Move, pinned: u64, checkers: u64) -> bool {
-        let from = m.from();
-        let to = m.to();
-        let flags = m.flags();
-        let moving_color = self.side_to_move;
-
-        let pt = self.pieces[from as usize];
-
-        // 2. Special moves
-        match flags {
-            flags::KING_CASTLE | flags::QUEEN_CASTLE => {
-                return self.is_legal_castling(m);
-            }
-            flags::EN_PASSANT => {
-                return self.is_legal_en_passant(m);
-            }
-            _ => {}
-        }
-
-        // 3. Normal moves
-        if checkers == 0 {
-            if pt == PieceType::King {
-                let occ = self.all_occupancy ^ bit(from);
-                return !self.is_square_attacked_with_occ(to, moving_color.opposite(), occ);
-            }
-            if (pinned & bit(from)) == 0 {
-                return true;
-            }
-            return self.is_pinned_move_legal(from, to, pinned);
-        }
-
-        // 4. In check
-        self.is_legal_when_in_check_fast(m, pinned, checkers)
-    }
-
-    #[inline(never)]
-    fn is_legal_when_in_check_fast(&self, m: Move, _pinned: u64, checkers: u64) -> bool {
-        let side = self.side_to_move;
-        let num_checkers = count_bits(checkers);
-
-        let from = m.from();
-        let to = m.to();
-        let pt = self.pieces[from as usize];
-
-        if pt == PieceType::King {
-            let occ = self.all_occupancy ^ bit(from);
-            return !self.is_square_attacked_with_occ(to, side.opposite(), occ);
-        }
-
-        if num_checkers > 1 { return false; }
-
-        let checker_sq = checkers.trailing_zeros() as u8;
-        if to == checker_sq {
-            // Must not be pinned! (If we are pinned, we can't capture the checker unless it's on the pin ray)
-            // But wait, the standard is_legal handles pinned already?
-            // Actually, if we are in check, a pinned piece can only capture the checker if the checker is on the pin ray.
-            // Since is_pinned_move_legal handles that, we should use it.
-            return self.is_pinned_move_legal(from, to, _pinned);
-        }
-
-        let checker_pt = self.pieces[checker_sq as usize];
-        if checker_pt == PieceType::Knight || checker_pt == PieceType::Pawn {
-            return false;
-        }
-
-        let block_mask = self.between(checker_sq, self.kings[side.idx()].trailing_zeros() as u8);
-        if (block_mask & bit(to)) != 0 {
-             return self.is_pinned_move_legal(from, to, _pinned);
-        }
-        false
-    }
-
-    // ===================================================================
-    // Helper: Pinned piece move validation
-    // ===================================================================
-    #[inline(always)]
-    fn is_pinned_move_legal(&self, from: u8, to: u8, pinned: u64) -> bool {
-        if (pinned & bit(from)) == 0 {
-            return true;
-        }
-        let king_sq = self.kings[self.side_to_move.idx()].trailing_zeros() as u8;
-        crate::magic::aligned(from, to, king_sq)
-    }
-
-    // ===================================================================
-    // Helper: Legal when in check (single or double check)
-    // ===================================================================
-    #[inline(never)]
-    fn is_legal_when_in_check(&self, m: Move) -> bool {
-        let side = self.side_to_move;
-        let (_, checkers) = self.pins_and_checkers(side);
-
-        let num_checkers = count_bits(checkers);
-
-        if num_checkers == 0 {
-            return true; // should not happen
-        }
-
-        let from = m.from();
-        let to = m.to();
-        let pt = self.pieces[from as usize];
-
-        // King moves are always legal if target is not attacked (must exclude original square from occupancy)
-        if pt == PieceType::King {
-            let occ = self.all_occupancy ^ bit(from);
-            return !self.is_square_attacked_with_occ(to, side.opposite(), occ);
-        }
-
-        // Double check → only king moves are possible
-        if num_checkers > 1 {
-            return false;
-        }
-
-        // Single check → can capture the checker or block it
-        let checker_sq = checkers.trailing_zeros() as u8;
-        let checker_pt = self.pieces[checker_sq as usize];
-
-        // Capture the checking piece?
-        if to == checker_sq {
-            return true; // pinned pieces already handled earlier
-        }
-
-        // Blocking (only possible against sliding pieces)
-        if checker_pt == PieceType::Knight || checker_pt == PieceType::Pawn {
-            return false; // cannot block
-        }
-
-        // Can we block?
-        let block_mask = self.between(checker_sq, self.kings[side.idx()].trailing_zeros() as u8);
-        (block_mask & bit(to)) != 0
     }
 
     /// Recomputes occupancy bitboards
