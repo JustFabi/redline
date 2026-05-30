@@ -194,6 +194,22 @@ pub fn evaluate(board: &Board, pawn_table: Option<&mut PawnTable>) -> i32 {
     if board.side_to_move == Color::White { total + tempo } else { -total + tempo }
 }
 
+/// Fast material-only evaluation for lazy eval cutoffs.
+/// Returns score from side_to_move's perspective.
+#[inline]
+pub fn evaluate_lazy(board: &Board) -> i32 {
+    let mut phase = 0;
+    phase += count_bits(board.knights[0] | board.knights[1]) as i32 * GAME_PHASE_INC[1];
+    phase += count_bits(board.bishops[0] | board.bishops[1]) as i32 * GAME_PHASE_INC[2];
+    phase += count_bits(board.rooks[0] | board.rooks[1]) as i32 * GAME_PHASE_INC[3];
+    phase += count_bits(board.queens[0] | board.queens[1]) as i32 * GAME_PHASE_INC[4];
+    let phase = cmp::min(phase, 24);
+    let phase_weight = (phase * 256 + 12) / 24;
+    let total = ((board.mg_pst * phase_weight) + (board.eg_pst * (256 - phase_weight))) / 256;
+    let tempo = 12;
+    if board.side_to_move == Color::White { total + tempo } else { -total + tempo }
+}
+
 fn evaluate_space(board: &Board, pawn_entry: &PawnEntry, phase: i32) -> EvalScore {
     let mut score = EvalScore::default();
     

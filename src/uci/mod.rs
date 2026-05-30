@@ -56,6 +56,7 @@ impl Uci {
             "isready" => vec!["readyok".into()],
             "ucinewgame" => {
                 self.board = Board::startpos();
+                self.searcher.clear_for_new_game();
                 vec![]
             }
             "position" => {
@@ -237,23 +238,41 @@ impl Uci {
             6
         };
 
-        // Clone needed data for the search thread
+        // Prepare the searcher for a new search: light reset preserves history tables
+        self.searcher.clear_for_search();
+        self.searcher.stop.store(false, Ordering::SeqCst);
+        self.searcher.nodes.store(0, Ordering::SeqCst);
+        
         let mut board_clone = self.board.clone();
         let num_threads = self.num_threads;
-        
-        // Use a pointer to searcher or a way to access it? 
-        // Searcher has Arc<AtomicBool> stop and Arc<TranspositionTable> tt.
-        // We need to be able to call search on it.
-        // Actually Searcher itself might need to be clonable or we create a new one with same Arcs.
         
         let tt_clone = Arc::clone(&self.searcher.tt);
         let nodes_clone = Arc::clone(&self.searcher.nodes);
         let stop_clone = Arc::clone(&self.searcher.stop);
         
+        // Copy accumulated history tables into the thread searcher
+        let history_clone = self.searcher.history.clone();
+        let capture_history_clone = self.searcher.capture_history.clone();
+        let counter_moves_clone = self.searcher.counter_moves.clone();
+        let cmh_history_clone = self.searcher.cmh_history.clone();
+        let cont_history_clone = self.searcher.cont_history.clone();
+        let low_ply_history_clone = self.searcher.low_ply_history.clone();
+        let age = self.searcher.age;
+        let settings = self.searcher.settings;
+        
         let handle = std::thread::spawn(move || {
             let mut thread_searcher = Searcher::new(tt_clone);
             thread_searcher.nodes = nodes_clone;
             thread_searcher.stop = stop_clone;
+            // Restore accumulated history from the persistent searcher
+            thread_searcher.history = history_clone;
+            thread_searcher.capture_history = capture_history_clone;
+            thread_searcher.counter_moves = counter_moves_clone;
+            thread_searcher.cmh_history = cmh_history_clone;
+            thread_searcher.cont_history = cont_history_clone;
+            thread_searcher.low_ply_history = low_ply_history_clone;
+            thread_searcher.age = age;
+            thread_searcher.settings = settings;
             
             let result = thread_searcher.search(&mut board_clone, search_depth, soft_limit, hard_limit, num_threads);
             

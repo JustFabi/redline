@@ -227,6 +227,80 @@ impl Searcher {
         }
     }
 
+    /// Light reset for a new search within the same game.
+    /// Preserves history tables (critical for Elo!) but resets per-search state.
+    pub fn clear_for_search(&mut self) {
+        self.seldepth = 0;
+        self.killer_moves = [[None; 2]; MAX_PLY];
+        self.move_stack = [(0, 0); MAX_PLY];
+        self.eval_history = [0; MAX_PLY];
+        for ply in 0..MAX_PLY {
+            self.pv_length[ply] = 0;
+            for i in 0..MAX_PLY {
+                self.pv_table[ply][i] = None;
+            }
+        }
+        self.root_delta = 400;
+        self.last_info_time = Instant::now();
+    }
+
+    /// Full reset for a new game. Zeroes all history tables.
+    pub fn clear_for_new_game(&mut self) {
+        self.clear_for_search();
+        // Zero all history tables
+        for side in 0..2 {
+            for from in 0..64 {
+                for to in 0..64 {
+                    self.history[side][from][to] = 0;
+                    self.low_ply_history[side][from][to] = 0;
+                }
+            }
+            for from in 0..64 {
+                for to in 0..64 {
+                    for from2 in 0..64 {
+                        self.cmh_history[side][from][to][from2] = 0;
+                    }
+                }
+            }
+            for piece in 0..6 {
+                for from in 0..64 {
+                    for to in 0..64 {
+                        self.capture_history[side][piece][from][to] = 0;
+                    }
+                }
+            }
+            for i in 0..4096 {
+                self.counter_moves[side][i] = None;
+            }
+        }
+        // Zero continuation history
+        for level in 0..CONT_HIST_LEVELS {
+            for pt1 in 0..7 {
+                for sq1 in 0..64 {
+                    for pt2 in 0..7 {
+                        for sq2 in 0..64 {
+                            self.cont_history[level][pt1][sq1][pt2][sq2] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        self.age = 0;
+    }
+
+    /// Age history tables by halving values. Called between searches
+    /// to gradually decay old data while preserving useful patterns.
+    pub fn age_history_tables(&mut self) {
+        for side in 0..2 {
+            for from in 0..64 {
+                for to in 0..64 {
+                    self.history[side][from][to] /= 2;
+                    self.low_ply_history[side][from][to] /= 2;
+                }
+            }
+        }
+    }
+
     pub fn format_score(&self, score: i32) -> String {
         if score > MATE_VALUE - 1000 {
             let mate_in = (MATE_VALUE - score + 1) / 2;
@@ -437,7 +511,30 @@ impl Searcher {
 
         if depth == 0 { return (None, self.quiescence(board, alpha, beta, ply)); }
 
-        let static_eval = evaluate(board, Some(&mut self.pawn_table));
+        let static_eval = if in_check {
+            // Don't compute expensive eval when in check—we won't use it for pruning
+            -INFINITY
+        } else {
+            let mut raw_eval = VALUE_NONE;
+            // Use TT value to refine static eval (Stockfish-inspired)
+            if tt_value != VALUE_NONE {
+                match tt_bound {
+                    NodeType::Exact => raw_eval = tt_value,
+                    NodeType::Beta if tt_value >= beta => raw_eval = tt_value,
+                    NodeType::Alpha if tt_value <= alpha => raw_eval = tt_value,
+                    _ => {}
+                }
+            }
+            if raw_eval == VALUE_NONE {
+                let lazy = crate::engine::eval::evaluate_lazy(board);
+                if lazy.abs() < MATE_VALUE - 1000 && (lazy + 300 <= alpha || lazy - 300 >= beta) {
+                    raw_eval = lazy;
+                } else {
+                    raw_eval = evaluate(board, Some(&mut self.pawn_table));
+                }
+            }
+            raw_eval
+        };
         self.eval_history[ply as usize] = static_eval;
         let improving = !in_check && ply >= 2 && static_eval > self.eval_history[ply as usize - 2];
 
@@ -528,11 +625,11 @@ impl Searcher {
 
             if self.settings.history_pruning && !is_pv_node && depth <= 8 && legal_moves > 1 && is_quiet {
                 let hist = self.history[us_idx][m.from() as usize][m.to() as usize];
-                if hist < -4000 * depth as i32 { continue; }
+                let threshold = -2000 * depth as i32;
+                if hist < threshold { continue; }
             }
 
-            if self.settings.lmp && !is_pv_node && depth < 10 && !in_check && is_quiet && legal_moves >= futility_move_count {
-                picker.skip_quiets = true;
+            if self.settings.lmp && !is_pv_node && depth < 10 && !in_check && is_quiet && legal_moves as u32 >= futility_move_count {
                 continue;
             }
 
@@ -561,6 +658,9 @@ impl Searcher {
 
             // Bug 5 fix: removed redundant is_legal_fast (already checked above)
             // Bug 1 fix: save side_to_move BEFORE make_move flips it (hoisted to us_idx)
+            // CRITICAL: compute piece type BEFORE make_move, since make_move moves the piece!
+            let moving_piece_type = (board.pieces[m.from() as usize] as usize).min(6);
+            let move_to_sq = m.to() as usize;
             let state = board.make_move(m);
             let mut score;
 
@@ -571,12 +671,10 @@ impl Searcher {
                 if !is_pv_node { r += 1024; }
                 let hist = self.history[us_idx][m.from() as usize][m.to() as usize];
                 r -= hist * 850 / 8192;
-                // Continuation history adjustment
-                let cur_pt = (board.pieces[m.from() as usize] as usize).min(6);
-                let cur_to = m.to() as usize;
+                // Continuation history adjustment - use pre-computed piece type (before make_move)
                 if ply >= 1 && (ply as usize - 1) < MAX_PLY {
                     let (prev_pt, prev_to) = self.move_stack[ply as usize - 1];
-                    let ch = self.cont_history[0][prev_pt.min(6)][prev_to][cur_pt][cur_to];
+                    let ch = self.cont_history[0][prev_pt.min(6)][prev_to][moving_piece_type][move_to_sq];
                     r -= ch * 512 / 8192;
                 }
                 
@@ -664,7 +762,16 @@ impl Searcher {
 
         let (pinned, checkers) = board.pins_and_checkers(board.side_to_move);
         let in_check = checkers != 0;
-        let mut stand_pat = if in_check { -INFINITY } else { evaluate(board, Some(&mut self.pawn_table)) };
+        let mut stand_pat = if in_check { 
+            -INFINITY 
+        } else { 
+            let lazy = crate::engine::eval::evaluate_lazy(board);
+            if lazy.abs() < MATE_VALUE - 1000 && (lazy + 300 <= alpha || lazy - 300 >= beta) {
+                lazy
+            } else {
+                evaluate(board, Some(&mut self.pawn_table))
+            }
+        };
 
         if let Some(entry) = tt_entry {
             if entry.node_type == NodeType::Exact || (entry.node_type == NodeType::Alpha && tt_value < stand_pat) || (entry.node_type == NodeType::Beta && tt_value > stand_pat) {
