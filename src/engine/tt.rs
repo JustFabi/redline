@@ -74,14 +74,19 @@ impl TranspositionTable {
             return;
         }
 
-        // Slot 2 is Depth-Preferred
+        // Slot 2: depth-preferred; on equal depth replace stale entries (SF-style aging).
         let existing_depth2 = (data2 & 0xFF) as u8;
-        
-        if depth >= existing_depth2 {
+        let existing_age2 = ((data2 >> 42) & 0x3F) as u8;
+        let age_diff = age.wrapping_sub(existing_age2);
+        let replace_slot2 = depth > existing_depth2
+            || (depth == existing_depth2 && age_diff > 32)
+            || (existing_depth2 == 0);
+
+        if replace_slot2 {
             self.table[idx + 3].store(data, Ordering::Relaxed);
             self.table[idx + 2].store(key ^ data, Ordering::Release);
         } else {
-            // Slot 1 is Always-Replace
+            // Slot 1 is always-replace (keeps probe chain fresh under pressure)
             self.table[idx + 1].store(data, Ordering::Relaxed);
             self.table[idx].store(key ^ data, Ordering::Release);
         }

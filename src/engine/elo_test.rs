@@ -13,7 +13,7 @@ pub fn run_elo_test(num_games: usize, depth_limit: Option<u32>, base_settings: S
     let mut draws = 0;
     use std::io::{self, Write};
 
-    let time_per_move = 1000;
+    let time_per_move: u64 = 1000;
 
     println!("=== Elo Test: {} games ===", num_games);
     println!("Full engine: all heuristics enabled");
@@ -56,13 +56,13 @@ pub fn run_elo_test(num_games: usize, depth_limit: Option<u32>, base_settings: S
         while !game_over {
             let is_player1_turn = (board.side_to_move == crate::board::piece::Color::White) == player1_is_white;
             
-            let search_depth = depth_limit.unwrap_or(64);
-            let soft_limit = if depth_limit.is_none() {
-                Some(Duration::from_millis(time_per_move))
+            let search_depth = depth_limit.unwrap_or(128);
+            let (soft_limit, hard_limit) = if depth_limit.is_none() {
+                let limit = Duration::from_millis(time_per_move.saturating_sub(10));
+                (Some(limit), Some(limit))
             } else {
-                None
+                (None, None)
             };
-            let hard_limit = Some(Duration::from_millis(time_per_move));
 
             if is_player1_turn {
                 print!("F");

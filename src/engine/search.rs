@@ -163,6 +163,9 @@ pub struct Searcher {
     pub root_delta: i32,
     pub last_info_time: Instant,
     pub settings: SearchSettings,
+    pub node_limit: Option<u64>,
+    stat_score: [i32; MAX_PLY],
+    move_count_stack: [u32; MAX_PLY],
 }
 
 impl Searcher {
@@ -224,6 +227,9 @@ impl Searcher {
             root_delta: 400,
             last_info_time: Instant::now(),
             settings: SearchSettings::default(),
+            node_limit: None,
+            stat_score: [0; MAX_PLY],
+            move_count_stack: [0; MAX_PLY],
         }
     }
 
@@ -242,6 +248,8 @@ impl Searcher {
         }
         self.root_delta = 400;
         self.last_info_time = Instant::now();
+        self.node_limit = None;
+        self.age_history_tables();
     }
 
     /// Full reset for a new game. Zeroes all history tables.
@@ -298,6 +306,31 @@ impl Searcher {
                     self.low_ply_history[side][from][to] /= 2;
                 }
             }
+            for piece in 0..6 {
+                for from in 0..64 {
+                    for to in 0..64 {
+                        self.capture_history[side][piece][from][to] /= 2;
+                    }
+                }
+            }
+            for from in 0..64 {
+                for to in 0..64 {
+                    for from2 in 0..64 {
+                        self.cmh_history[side][from][to][from2] /= 2;
+                    }
+                }
+            }
+        }
+        for level in 0..CONT_HIST_LEVELS {
+            for pt1 in 0..7 {
+                for sq1 in 0..64 {
+                    for pt2 in 0..7 {
+                        for sq2 in 0..64 {
+                            self.cont_history[level][pt1][sq1][pt2][sq2] /= 2;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -342,6 +375,7 @@ impl Searcher {
         self.hard_time_limit = hard_time_limit;
         self.nodes.store(0, Ordering::SeqCst);
         self.age = self.age.wrapping_add(1);
+        crate::engine::syzygy::reset_tb_hits();
 
         if num_threads <= 1 {
             return self.internal_search(board, depth);
@@ -370,6 +404,16 @@ impl Searcher {
     }
 
     fn internal_search(&mut self, board: &mut Board, depth: u32) -> SearchResult {
+        if let Some((m, score)) = crate::engine::syzygy::probe_root(board) {
+            if score.abs() >= crate::engine::syzygy::TB_VALUE - 100 {
+                return SearchResult {
+                    best_move: Some(m),
+                    score,
+                    depth: 64,
+                };
+            }
+        }
+
         let mut best_move = None;
         let mut best_score = -INFINITY;
         let mut previous_best_move = None;
@@ -471,12 +515,31 @@ impl Searcher {
         if (self.nodes.fetch_add(1, Ordering::Relaxed) & 2047) == 0 { self.check_time(); }
         if self.stop.load(Ordering::Relaxed) { return (None, 0); }
         if ply >= MAX_PLY as u32 - 1 { return (None, evaluate(board, Some(&mut self.pawn_table))); }
-        if board.is_repetition() || board.halfmove_clock >= 100 { return (None, 0); }
+        if board.is_repetition() || board.halfmove_clock >= 100 {
+            let draw = (self.nodes.load(Ordering::Relaxed) & 1) as i32 * 2 - 1;
+            return (None, draw);
+        }
 
         if ply > 0 && self.settings.mate_distance_pruning {
             alpha = alpha.max(-MATE_VALUE + ply as i32);
             beta = beta.min(MATE_VALUE - ply as i32 - 1);
             if alpha >= beta { return (None, alpha); }
+        }
+
+        if excluded_move.is_none() {
+            if let Some(tb_score) = crate::engine::syzygy::probe_wdl_score(board, ply) {
+                if !is_pv_node {
+                    if tb_score >= beta {
+                        return (None, tb_score);
+                    }
+                    if tb_score <= alpha {
+                        return (None, tb_score);
+                    }
+                }
+                if depth <= 2 {
+                    return (None, tb_score);
+                }
+            }
         }
 
         self.seldepth = self.seldepth.max(ply);
@@ -557,23 +620,6 @@ impl Searcher {
             }
         }
 
-        let mut extension = 0;
-        if self.settings.singular_extensions 
-            && !is_pv_node 
-            && depth >= 8 
-            && excluded_move.is_none() 
-            && tt_move.is_some() 
-            && tt_depth >= depth as u8 - 3 
-            && tt_bound != NodeType::Alpha 
-            && tt_value.abs() < MATE_VALUE - 1000 
-        {
-            let s_beta = tt_value - depth as i32;
-            let (_, s_score) = self.negamax(board, depth / 2, s_beta - 1, s_beta, ply, tt_move);
-            if s_score < s_beta {
-                extension = 1;
-            }
-        }
-
         if !is_pv_node && depth >= 3 && excluded_move.is_none() && beta.abs() < MATE_VALUE - 1000 {
             let probcut_beta = beta + 200 - if improving { 49 } else { 0 };
             let q_score = self.quiescence(board, probcut_beta - 1, probcut_beta, ply);
@@ -624,9 +670,17 @@ impl Searcher {
             let is_first_move = legal_moves == 1;
 
             if self.settings.history_pruning && !is_pv_node && depth <= 8 && legal_moves > 1 && is_quiet {
-                let hist = self.history[us_idx][m.from() as usize][m.to() as usize];
+                let from = m.from() as usize;
+                let to = m.to() as usize;
+                let pt = (board.pieces[from] as usize).min(6);
+                let mut combined = self.history[us_idx][from][to];
+                if ply >= 1 && (ply as usize) < MAX_PLY {
+                    let (prev_pt, prev_to) = self.move_stack[ply as usize - 1];
+                    combined += self.cont_history[0][prev_pt.min(6)][prev_to][pt][to];
+                }
                 let threshold = -2000 * depth as i32;
-                if hist < threshold { continue; }
+                if combined < threshold { continue; }
+                if depth <= 4 && legal_moves > 4 && combined < 25000 { continue; }
             }
 
             if self.settings.lmp && !is_pv_node && depth < 10 && !in_check && is_quiet && legal_moves as u32 >= futility_move_count {
@@ -660,44 +714,127 @@ impl Searcher {
             // Bug 1 fix: save side_to_move BEFORE make_move flips it (hoisted to us_idx)
             // CRITICAL: compute piece type BEFORE make_move, since make_move moves the piece!
             let moving_piece_type = (board.pieces[m.from() as usize] as usize).min(6);
+            let move_from_sq = m.from() as usize;
             let move_to_sq = m.to() as usize;
+            let mut move_extension = 0u32;
+            let mut singular_lmr = false;
+
+            // Singular extension on TT move (Stockfish 11 style, in move loop)
+            if self.settings.singular_extensions
+                && !is_pv_node
+                && depth >= 6
+                && excluded_move.is_none()
+                && Some(m) == tt_move
+                && tt_depth >= depth as u8 - 3
+                && tt_bound != NodeType::Alpha
+                && tt_value.abs() < MATE_VALUE - 1000
+            {
+                let s_beta = tt_value - 2 * depth as i32;
+                let (_, s_score) = self.negamax(board, depth / 2, s_beta - 1, s_beta, ply, Some(m));
+                if s_score < s_beta {
+                    move_extension = 1;
+                    singular_lmr = true;
+                } else if s_score >= beta {
+                    return (Some(m), s_score);
+                }
+            }
+
             let state = board.make_move(m);
+            let gives_check = board.is_in_check(board.side_to_move);
+            if gives_check {
+                move_extension = move_extension.max(1);
+            }
+
+            let mut stat_score = self.history[us_idx][move_from_sq][move_to_sq];
+            if ply >= 1 && (ply as usize) < MAX_PLY {
+                let (prev_pt, prev_to) = self.move_stack[ply as usize - 1];
+                stat_score += self.cont_history[0][prev_pt.min(6)][prev_to][moving_piece_type][move_to_sq];
+                if CONT_HIST_LEVELS > 1 {
+                    stat_score += self.cont_history[1][prev_pt.min(6)][prev_to][moving_piece_type][move_to_sq];
+                }
+                if CONT_HIST_LEVELS > 3 {
+                    stat_score += self.cont_history[3][prev_pt.min(6)][prev_to][moving_piece_type][move_to_sq];
+                }
+            }
+            stat_score -= 4926;
+            if stat_score < 0
+                && ply >= 1
+                && (ply as usize) < MAX_PLY
+            {
+                let (prev_pt, prev_to) = self.move_stack[ply as usize - 1];
+                if self.cont_history[0][prev_pt.min(6)][prev_to][moving_piece_type][move_to_sq] >= 0
+                    && self.history[us_idx][move_from_sq][move_to_sq] >= 0
+                {
+                    stat_score = 0;
+                }
+            }
+            if (ply as usize) < MAX_PLY {
+                self.stat_score[ply as usize] = stat_score;
+            }
+
+            let new_depth = depth - 1 + move_extension;
             let mut score;
 
-            if self.settings.lmr && !is_first_move && depth >= 3 && is_quiet && Some(m) != tt_move {
+            let do_lmr = self.settings.lmr
+                && !is_first_move
+                && depth >= 3
+                && is_quiet
+                && Some(m) != tt_move;
+
+            if do_lmr {
                 let mut r = self.reduction(improving, depth, legal_moves as i32, beta - alpha, self.root_delta);
-                if is_pv_node { r -= 1024; }
-                // Cut node bonus: increase reduction at cut nodes (non-PV, beta = alpha+1)
-                if !is_pv_node { r += 1024; }
-                let hist = self.history[us_idx][m.from() as usize][m.to() as usize];
+                if is_pv_node {
+                    r -= 1024;
+                } else {
+                    r += 1024;
+                }
+                if singular_lmr {
+                    r -= 2048;
+                }
+                if ply >= 1 && self.move_count_stack[(ply - 1) as usize] > 14 {
+                    r -= 1024;
+                }
+                if ply >= 2 {
+                    let opp_stat = self.stat_score[(ply - 2) as usize];
+                    if stat_score >= -102 && opp_stat < -114 {
+                        r -= 1024;
+                    } else if opp_stat >= -116 && stat_score < -154 {
+                        r += 1024;
+                    }
+                }
+                if is_quiet {
+                    if tt_move.map(|tm| (tm.flags() & flags::CAPTURE) != 0).unwrap_or(false) {
+                        r += 1024;
+                    }
+                    r -= stat_score * 1024 / 16384;
+                }
+                let hist = self.history[us_idx][move_from_sq][move_to_sq];
                 r -= hist * 850 / 8192;
-                // Continuation history adjustment - use pre-computed piece type (before make_move)
                 if ply >= 1 && (ply as usize - 1) < MAX_PLY {
                     let (prev_pt, prev_to) = self.move_stack[ply as usize - 1];
                     let ch = self.cont_history[0][prev_pt.min(6)][prev_to][moving_piece_type][move_to_sq];
                     r -= ch * 512 / 8192;
                 }
-                
-                let d = 1.max(std::cmp::min(depth as i32 - 1 - r / 1024, depth as i32 - 1)) as u32;
+
+                let d = 1.max(std::cmp::min(new_depth as i32 - r / 1024, new_depth as i32)) as u32;
                 (_, score) = self.negamax(board, d, -alpha - 1, -alpha, ply + 1, None);
                 score = -score;
 
-                if score > alpha && d < depth - 1 {
-                    let new_depth = depth - 1 + extension;
+                if score > alpha && d < new_depth {
                     (_, score) = self.negamax(board, new_depth, -alpha - 1, -alpha, ply + 1, None);
                     score = -score;
                 }
             } else if !is_first_move {
-                (_, score) = self.negamax(board, depth - 1 + extension, -alpha - 1, -alpha, ply + 1, None);
+                (_, score) = self.negamax(board, new_depth, -alpha - 1, -alpha, ply + 1, None);
                 score = -score;
             } else {
-                (_, score) = self.negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1, None);
+                (_, score) = self.negamax(board, new_depth, -beta, -alpha, ply + 1, None);
                 score = -score;
             }
 
             // PVS Re-search
             if is_pv_node && !is_first_move && score > alpha && score < beta {
-                (_, score) = self.negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1, None);
+                (_, score) = self.negamax(board, new_depth, -beta, -alpha, ply + 1, None);
                 score = -score;
             }
 
@@ -730,6 +867,9 @@ impl Searcher {
         }
 
         if legal_moves == 0 { return (None, if in_check { -MATE_VALUE + ply as i32 } else { 0 }); }
+        if (ply as usize) < MAX_PLY {
+            self.move_count_stack[ply as usize] = legal_moves;
+        }
         let node_type = if max_score >= beta { NodeType::Beta } else if max_score > old_alpha { NodeType::Exact } else { NodeType::Alpha };
         let store_score = self.value_to_tt(max_score, ply);
         self.tt.store(board.hash, depth as u8, store_score, node_type, best_m, self.age);
@@ -741,8 +881,19 @@ impl Searcher {
         if (ply as usize) < MAX_PLY { self.pv_length[ply as usize] = 0; }
         if (self.nodes.load(Ordering::Relaxed) & 2047) == 0 { self.check_time(); }
         if ply >= MAX_PLY as u32 - 1 { return evaluate(board, Some(&mut self.pawn_table)); }
-        if board.is_repetition() || board.halfmove_clock >= 100 { return 0; }
+        if board.is_repetition() || board.halfmove_clock >= 100 {
+            return (self.nodes.load(Ordering::Relaxed) & 1) as i32 * 2 - 1;
+        }
         self.seldepth = self.seldepth.max(ply);
+
+        if let Some(tb_score) = crate::engine::syzygy::probe_wdl_score(board, ply) {
+            if tb_score >= beta {
+                return tb_score;
+            }
+            if tb_score <= alpha {
+                return tb_score;
+            }
+        }
 
         let tt_entry = self.tt.probe(board.hash);
         let tt_move = tt_entry.and_then(|e| e.best_move);
@@ -954,16 +1105,37 @@ impl Searcher {
     }
 
     fn check_time(&mut self) {
+        if let Some(limit) = self.node_limit {
+            if self.nodes.load(Ordering::Relaxed) >= limit {
+                self.stop.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
         let elapsed = self.start_time.elapsed();
-        if let Some(l) = self.hard_time_limit.or(self.soft_time_limit) {
-            if elapsed >= l { self.stop.store(true, Ordering::Relaxed); }
+        if let Some(hard) = self.hard_time_limit {
+            if elapsed >= hard {
+                self.stop.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+        if let Some(soft) = self.soft_time_limit {
+            if self.hard_time_limit.is_none() && elapsed >= soft {
+                self.stop.store(true, Ordering::Relaxed);
+            }
         }
         if self.is_main_thread && self.last_info_time.elapsed() >= Duration::from_millis(1000) {
             self.last_info_time = Instant::now();
             let nodes = self.nodes.load(Ordering::Relaxed);
             let time = elapsed.as_millis() as u64;
             let nps = if time > 0 { (nodes * 1000) / time } else { 0 };
-            println!("info nodes {} nps {} time {} hashfull {}", nodes, nps, time, self.tt.hashfull());
+            println!(
+                "info nodes {} nps {} time {} hashfull {} tbhits {}",
+                nodes,
+                nps,
+                time,
+                self.tt.hashfull(),
+                crate::engine::syzygy::tb_hits()
+            );
         }
     }
 

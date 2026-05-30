@@ -10,16 +10,21 @@ pub struct Uci {
     board: Board,
     searcher: Searcher,
     num_threads: usize,
+    syzygy_path: Option<String>,
     search_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Uci {
     pub fn new() -> Self {
         let tt = Arc::new(TranspositionTable::new(64)); // 64MB default
+        let syzygy_path = crate::paths::resolve_syzygy_path(None)
+            .map(|p| crate::paths::syzygy_path_string(&p));
+        let _ = crate::engine::syzygy::init(syzygy_path.as_deref());
         Self {
             board: Board::startpos(),
             searcher: Searcher::new(tt),
             num_threads: 1,
+            syzygy_path,
             search_thread: None,
         }
     }
@@ -51,6 +56,7 @@ impl Uci {
                 "".into(),
                 "option name Hash type spin default 64 min 1 max 4096".into(),
                 "option name Threads type spin default 1 min 1 max 128".into(),
+                "option name SyzygyPath type string default syzygy".into(),
                 "uciok".into(),
             ],
             "isready" => vec!["readyok".into()],
@@ -141,6 +147,9 @@ impl Uci {
                 let tt = Arc::new(TranspositionTable::new(mb));
                 self.searcher.tt = tt;
             }
+        } else if args.len() >= 4 && args[0] == "name" && args[1] == "SyzygyPath" && args[2] == "value" {
+            self.syzygy_path = Some(args[3].to_string());
+            let _ = crate::engine::syzygy::init(self.syzygy_path.as_deref());
         }
     }
 
@@ -259,11 +268,13 @@ impl Uci {
         let low_ply_history_clone = self.searcher.low_ply_history.clone();
         let age = self.searcher.age;
         let settings = self.searcher.settings;
+        let node_limit = nodes;
         
         let handle = std::thread::spawn(move || {
             let mut thread_searcher = Searcher::new(tt_clone);
             thread_searcher.nodes = nodes_clone;
             thread_searcher.stop = stop_clone;
+            thread_searcher.node_limit = node_limit;
             // Restore accumulated history from the persistent searcher
             thread_searcher.history = history_clone;
             thread_searcher.capture_history = capture_history_clone;
@@ -295,8 +306,9 @@ impl Uci {
                 let total_nodes = thread_searcher.nodes.load(Ordering::Relaxed);
                 let nps = if elapsed > 0 { (total_nodes * 1000) / elapsed } else { 0 };
                 let hashfull = thread_searcher.tt.hashfull();
-                println!("info depth {} seldepth {} multipv 1 score {} nodes {} nps {} hashfull {} tbhits 0 time {}",
-                    depth, thread_searcher.seldepth, thread_searcher.format_score(score), total_nodes, nps, hashfull, elapsed);
+                println!("info depth {} seldepth {} multipv 1 score {} nodes {} nps {} hashfull {} tbhits {} time {}",
+                    depth, thread_searcher.seldepth, thread_searcher.format_score(score), total_nodes, nps, hashfull,
+                    crate::engine::syzygy::tb_hits(), elapsed);
                 println!("bestmove {}", m);
             } else {
                 // Fallback: pick the first legal move if nothing was found
